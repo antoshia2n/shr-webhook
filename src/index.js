@@ -71,10 +71,9 @@ async function logBilling(env, memberId, eventType, payload) {
 }
 
 async function handleEvent(env, event, payload, debug = { steps: [] }) {
-  // subscription_id を取得（イベント種別によって場所が違う）
   const subscriptionId =
-    payload?.data?.subscription_id ?? // charge_finished
-    payload?.data?.id;                // subscription_payment / failed / canceled
+    payload?.data?.subscription_id ??
+    payload?.data?.id;
 
   debug.subscriptionId = subscriptionId;
 
@@ -85,13 +84,11 @@ async function handleEvent(env, event, payload, debug = { steps: [] }) {
   debug.memberFound = !!member;
   debug.memberId = member?.id ?? null;
 
-  // 課金ログは常に保存
   const logResult = await logBilling(env, member?.id ?? null, event, payload);
-  debug.steps.push({ step: "logBilling", result: logResult });
+  debug.steps.push({ step: "logBilling", ok: logResult.ok, status: logResult.status });
 
   switch (event) {
 
-    // 初回課金完了 → 新規会員作成 or アクティブ化
     case "charge_finished": {
       if (payload?.data?.status !== "successful") break;
       const meta = payload?.data?.metadata ?? {};
@@ -99,12 +96,14 @@ async function handleEvent(env, event, payload, debug = { steps: [] }) {
       const plan = meta["plan"] ?? "standard";
       const tokenId = payload?.data?.transaction_token_id;
 
-      // UnivaPayのAPIからemail取得
-      const email = tokenId
-        ? await getEmailFromUnivaPay(env, tokenId)
-        : null;
-
-      debug.steps.push({ step: "getEmail", email: email ?? "取得失敗" });
+      // emailを取得（失敗してもメンバー登録は続ける）
+      let email = null;
+      try {
+        email = tokenId ? await getEmailFromUnivaPay(env, tokenId) : null;
+        debug.steps.push({ step: "getEmail", email: email ?? "null" });
+      } catch (e) {
+        debug.steps.push({ step: "getEmail", error: e.message });
+      }
 
       if (!member) {
         const createResult = await supabase(env, "POST", "/shr_members", {
@@ -112,22 +111,22 @@ async function handleEvent(env, event, payload, debug = { steps: [] }) {
           email: email ?? `pending_${subscriptionId}@shia2n.jp`,
           name,
           plan,
-          subscription_status: "pending", // portal紐づけ後にactiveへ
+          subscription_status: "pending",
           univa_subscription_id: subscriptionId,
           enrolled_at: new Date().toISOString(),
         });
-        debug.steps.push({ step: "createMember", result: createResult });
+        debug.steps.push({ step: "createMember", ok: createResult.ok, status: createResult.status, data: createResult.data });
       } else {
         await updateMemberById(env, member.id, {
           subscription_status: "active",
           name: name ?? member.name,
           plan: plan ?? member.plan,
         });
+        debug.steps.push({ step: "updateMember", memberId: member.id });
       }
       break;
     }
 
-    // 月次課金成功
     case "subscription_payment": {
       if (!member) break;
       const nextDate = new Date();
@@ -139,14 +138,12 @@ async function handleEvent(env, event, payload, debug = { steps: [] }) {
       break;
     }
 
-    // 課金失敗
     case "subscription_failed": {
       if (!member) break;
       await updateMemberById(env, member.id, { subscription_status: "past_due" });
       break;
     }
 
-    // 解約
     case "subscription_canceled": {
       if (!member) break;
       await updateMemberById(env, member.id, {
@@ -166,11 +163,12 @@ export default {
       return new Response(null, { status: 204, headers: CORS });
     }
 
+    // ヘルスチェック
     if (url.pathname === "/health") {
       return json({ ok: true });
     }
 
-    // 診断用エンドポイント：環境変数とSupabase接続を検証
+    // 診断エンドポイント
     if (url.pathname === "/diag") {
       const diag = {
         env_check: {
@@ -183,19 +181,15 @@ export default {
         },
       };
 
-      // Supabase接続テスト
+      // Supabase疎通テスト
       try {
         const ping = await supabase(env, "GET", "/shr_members?limit=1");
-        diag.supabase_ping = {
-          ok: ping.ok,
-          status: ping.status,
-          data: ping.data,
-        };
+        diag.supabase_ping = { ok: ping.ok, status: ping.status };
       } catch (e) {
         diag.supabase_ping = { error: e.message };
       }
 
-      // shr_members テーブルへのテスト書き込み
+      // Supabase書き込みテスト
       try {
         const testId = `test-${Date.now()}`;
         const insert = await supabase(env, "POST", "/shr_members", {
@@ -206,24 +200,33 @@ export default {
           subscription_status: "active",
           univa_subscription_id: testId,
         });
-        diag.test_insert = {
-          ok: insert.ok,
-          status: insert.status,
-          data: insert.data,
-        };
-
-        // 成功したら掃除
+        diag.test_insert = { ok: insert.ok, status: insert.status };
         if (insert.ok) {
           await supabase(env, "DELETE", `/shr_members?univa_subscription_id=eq.${testId}`);
           diag.test_insert.cleaned_up = true;
+        } else {
+          diag.test_insert.error_detail = insert.data;
         }
       } catch (e) {
         diag.test_insert = { error: e.message };
       }
 
+      // UnivaPayのAPI疎通テスト
+      try {
+        const uniRes = await fetch(
+          `https://api.univapay.com/stores/${env.UNIVA_STORE_ID}`,
+          { headers: { "Authorization": `Bearer ${env.UNIVA_APP_TOKEN}.${env.UNIVA_APP_SECRET}` } }
+        );
+        const uniText = await uniRes.text();
+        diag.univapay_ping = { ok: uniRes.ok, status: uniRes.status, body: uniText.substring(0, 300) };
+      } catch (e) {
+        diag.univapay_ping = { error: e.message };
+      }
+
       return json(diag);
     }
 
+    // UnivaPayのWebhook受信口
     if (url.pathname === "/univapay" && request.method === "POST") {
       let payload;
       try {
