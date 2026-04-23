@@ -319,6 +319,24 @@ export default {
       return json({ ok: true, event, debug });
     }
 
+    // テスト用：ブラウザからウェルカムメール送信を確認する
+    // 例: /test-welcome?email=you@example.com&name=テスト太郎&plan=standard
+    if (url.pathname === "/test-welcome" && request.method === "GET") {
+      const email          = url.searchParams.get("email");
+      const name           = url.searchParams.get("name") ?? "テストユーザー";
+      const plan           = url.searchParams.get("plan") ?? "standard";
+      const subscriptionId = `test-${Date.now()}`;
+
+      if (!email) {
+        return json({ error: "emailパラメータが必要です。例: /test-welcome?email=you@example.com" }, 400);
+      }
+
+      const debug = { steps: [] };
+      await sendWelcomeEmail(env, { email, name, plan, subscriptionId }, debug);
+
+      return json({ ok: true, sentTo: email, name, plan, subscriptionId, debug });
+    }
+
     return json({ error: "not_found" }, 404);
   },
 };
