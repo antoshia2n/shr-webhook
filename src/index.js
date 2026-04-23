@@ -146,6 +146,57 @@ export default {
       return json({ ok: true });
     }
 
+    // 診断用エンドポイント：環境変数とSupabase接続を検証
+    if (url.pathname === "/diag") {
+      const diag = {
+        env_check: {
+          SUPABASE_URL: env.SUPABASE_URL ? "set" : "MISSING",
+          SUPABASE_ANON_KEY: env.SUPABASE_ANON_KEY ? `set (length=${env.SUPABASE_ANON_KEY.length})` : "MISSING",
+          DEFAULT_USER_ID: env.DEFAULT_USER_ID ? `set (${env.DEFAULT_USER_ID.substring(0, 8)}...)` : "MISSING",
+        },
+      };
+
+      // Supabase接続テスト
+      try {
+        const ping = await supabase(env, "GET", "/shr_members?limit=1");
+        diag.supabase_ping = {
+          ok: ping.ok,
+          status: ping.status,
+          data: ping.data,
+        };
+      } catch (e) {
+        diag.supabase_ping = { error: e.message };
+      }
+
+      // shr_members テーブルへのテスト書き込み
+      try {
+        const testId = `test-${Date.now()}`;
+        const insert = await supabase(env, "POST", "/shr_members", {
+          user_id: env.DEFAULT_USER_ID ?? "test-uid",
+          email: `diag_${testId}@shia2n.jp`,
+          name: "診断テスト",
+          plan: "standard",
+          subscription_status: "active",
+          univa_subscription_id: testId,
+        });
+        diag.test_insert = {
+          ok: insert.ok,
+          status: insert.status,
+          data: insert.data,
+        };
+
+        // 成功したら掃除
+        if (insert.ok) {
+          await supabase(env, "DELETE", `/shr_members?univa_subscription_id=eq.${testId}`);
+          diag.test_insert.cleaned_up = true;
+        }
+      } catch (e) {
+        diag.test_insert = { error: e.message };
+      }
+
+      return json(diag);
+    }
+
     if (url.pathname === "/univapay" && request.method === "POST") {
       let payload;
       try {
