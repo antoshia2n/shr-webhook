@@ -53,6 +53,36 @@ async function findMemberBySubscriptionId(env, subscriptionId) {
   return Array.isArray(data) ? data[0] : null;
 }
 
+// -----------------------------------------------------------------------
+// pay_products テーブルから plan_key に対応する商品情報を取得
+// 戻り値: { name, payment_status } | null
+// -----------------------------------------------------------------------
+async function lookupProduct(env, planKey) {
+  const res = await fetch(
+    `${env.SUPABASE_URL}/rest/v1/pay_products` +
+    `?user_id=eq.${env.DEFAULT_USER_ID}` +
+    `&plan_key=eq.${encodeURIComponent(planKey)}` +
+    `&active=eq.true` +
+    `&select=name,payment_status&limit=1`,
+    {
+      headers: {
+        apikey:        env.SUPABASE_ANON_KEY,
+        Authorization: `Bearer ${env.SUPABASE_ANON_KEY}`,
+      },
+    }
+  );
+  const rows = await res.json();
+  return rows?.[0] ?? null;
+}
+
+// plan_key から表示名を返す（DB参照、見つからなければ plan_key をそのまま返す）
+async function getPlanLabel(env, planKey) {
+  const product = await lookupProduct(env, planKey ?? "standard");
+  return product?.name ?? planKey ?? "スタンダード";
+}
+
+// -----------------------------------------------------------------------
+
 // 会員ステータス更新
 async function updateMemberById(env, id, fields) {
   await supabase(env, "PATCH",
@@ -75,7 +105,6 @@ async function logBilling(env, memberId, eventType, payload) {
 
 // High-Shinくんのウェルカムメール送信を依頼
 async function sendWelcomeEmail(env, { email, name, plan, subscriptionId }, debug) {
-  // pending_ プレースホルダーの場合はスキップ
   if (!email || email.startsWith("pending_")) {
     debug.steps.push({ step: "sendWelcome", skipped: "no_valid_email" });
     return;
@@ -106,14 +135,12 @@ async function sendWelcomeEmail(env, { email, name, plan, subscriptionId }, debu
       body: text.substring(0, 200),
     });
   } catch (e) {
-    // メール送信失敗はWebhook全体を失敗させない
     debug.steps.push({ step: "sendWelcome", error: e.message });
   }
 }
 
-
 // Naokiへの新規入会通知メール
-async function sendAdminNotification(env, { email, name, plan, subscriptionId }, debug) {
+async function sendAdminNotification(env, { email, name, planLabel, subscriptionId }, debug) {
   const resendKey   = (env.RESEND_API_KEY    ?? "").trim();
   const fromEmail   = (env.RESEND_FROM_EMAIL ?? "").trim();
   const notifyEmail = (env.NAOKI_NOTIFY_EMAIL ?? "").trim();
@@ -123,7 +150,6 @@ async function sendAdminNotification(env, { email, name, plan, subscriptionId },
     return;
   }
 
-  const planLabel = plan === "premium" ? "プレミアム" : "スタンダード";
   const now = new Date().toLocaleString("ja-JP", { timeZone: "Asia/Tokyo" });
 
   try {
@@ -157,9 +183,7 @@ async function sendAdminNotification(env, { email, name, plan, subscriptionId },
   }
 }
 
-
 // 汎用メール送信ヘルパー
-// text の改行を <br> に変換して HTML も生成する（文字化け防止）
 async function sendEmail(env, { to, subject, text }) {
   const resendKey = (env.RESEND_API_KEY    ?? "").trim();
   const fromEmail = (env.RESEND_FROM_EMAIL ?? "").trim();
@@ -194,7 +218,7 @@ async function sendReceiptEmail(env, member, debug) {
     debug.steps.push({ step: "receiptEmail", skipped: "no_valid_email" });
     return;
   }
-  const planLabel = member.plan === "premium" ? "プレミアム" : "スタンダード";
+  const planLabel = await getPlanLabel(env, member.plan);
   const now = new Date().toLocaleString("ja-JP", { timeZone: "Asia/Tokyo" });
   const result = await sendEmail(env, {
     to: member.email,
@@ -222,7 +246,7 @@ async function sendFailureEmailToUser(env, member, debug) {
     debug.steps.push({ step: "failureEmailUser", skipped: "no_valid_email" });
     return;
   }
-  const planLabel = member.plan === "premium" ? "プレミアム" : "スタンダード";
+  const planLabel = await getPlanLabel(env, member.plan);
   const result = await sendEmail(env, {
     to: member.email,
     subject: `【しあらぼNEXT】決済処理に失敗しました`,
@@ -247,7 +271,7 @@ async function sendFailureEmailToAdmin(env, member, debug) {
     debug.steps.push({ step: "failureEmailAdmin", skipped: "env_missing" });
     return;
   }
-  const planLabel = member?.plan === "premium" ? "プレミアム" : "スタンダード";
+  const planLabel = await getPlanLabel(env, member?.plan);
   const result = await sendEmail(env, {
     to: notifyEmail,
     subject: `【しあらぼNEXT】決済失敗：${member?.name ?? "不明"} (${planLabel})`,
@@ -271,7 +295,7 @@ async function sendCancellationEmail(env, member, debug) {
     debug.steps.push({ step: "cancellationEmail", skipped: "no_valid_email" });
     return;
   }
-  const planLabel = member.plan === "premium" ? "プレミアム" : "スタンダード";
+  const planLabel = await getPlanLabel(env, member.plan);
   const result = await sendEmail(env, {
     to: member.email,
     subject: `【しあらぼNEXT】解約が完了しました`,
@@ -311,8 +335,20 @@ async function handleEvent(env, event, payload, debug = { steps: [] }) {
       if (payload?.data?.status !== "successful") break;
       const meta    = payload?.data?.metadata ?? {};
       const name    = meta["univapay-name"] ?? null;
-      const plan    = meta["plan"] ?? "standard";
+      const planKey = meta["plan"] ?? "standard";
       const tokenId = payload?.data?.transaction_token_id;
+
+      // pay_products テーブルから商品情報を取得
+      const product = await lookupProduct(env, planKey);
+      if (!product) {
+        const errMsg = `unknown plan_key: ${planKey}`;
+        console.error(`[shr-webhook] ${errMsg}`);
+        debug.steps.push({ step: "lookupProduct", error: errMsg });
+        // 商品が見つからなくても処理は継続する（fallback）
+      }
+      const planLabel     = product?.name           ?? planKey;
+      const paymentStatus = product?.payment_status ?? "basic";
+      debug.steps.push({ step: "lookupProduct", planKey, planLabel, paymentStatus });
 
       let email = null;
       try {
@@ -327,24 +363,22 @@ async function handleEvent(env, event, payload, debug = { steps: [] }) {
           user_id: env.DEFAULT_USER_ID,
           email: email ?? `pending_${subscriptionId}@shia2n.jp`,
           name,
-          plan,
+          plan: planKey,
           subscription_status: "pending",
           univa_subscription_id: subscriptionId,
           enrolled_at: new Date().toISOString(),
         });
         debug.steps.push({ step: "createMember", ok: createResult.ok, status: createResult.status, data: createResult.data });
 
-        // 新規会員にウェルカムメールを送信
         if (createResult.ok) {
-          await sendWelcomeEmail(env, { email, name, plan, subscriptionId }, debug);
-          // Naokiに入会通知
-          await sendAdminNotification(env, { email, name, plan, subscriptionId }, debug);
+          await sendWelcomeEmail(env, { email, name, plan: planKey, subscriptionId }, debug);
+          await sendAdminNotification(env, { email, name, planLabel, subscriptionId }, debug);
         }
       } else {
         await updateMemberById(env, member.id, {
           subscription_status: "active",
           name: name ?? member.name,
-          plan: plan ?? member.plan,
+          plan: planKey ?? member.plan,
         });
         debug.steps.push({ step: "updateMember", memberId: member.id });
       }
@@ -417,6 +451,24 @@ export default {
         diag.supabase_ping = { error: e.message };
       }
 
+      // pay_products 疎通テスト（新規追加）
+      try {
+        const ping = await supabase(env, "GET", "/pay_products?limit=1");
+        diag.pay_products_ping = { ok: ping.ok, status: ping.status, count: ping.data?.length ?? 0 };
+      } catch (e) {
+        diag.pay_products_ping = { error: e.message };
+      }
+
+      // lookupProduct 動作確認（standard）
+      try {
+        const product = await lookupProduct(env, "standard");
+        diag.lookup_standard = product
+          ? { found: true, name: product.name, payment_status: product.payment_status }
+          : { found: false };
+      } catch (e) {
+        diag.lookup_standard = { error: e.message };
+      }
+
       // Supabase書き込みテスト
       try {
         const testId = `test-${Date.now()}`;
@@ -454,7 +506,7 @@ export default {
         diag.univapay_ping = { error: e.message };
       }
 
-      // High-Shin疎通テスト（/api/internal/send-welcome のヘルスチェック）
+      // High-Shin疎通テスト
       if (env.HIGH_SHIN_API_BASE && env.HIGH_SHIN_INTERNAL_SECRET) {
         try {
           const hsRes = await fetch(
@@ -502,23 +554,22 @@ export default {
       return json({ ok: true, event, debug });
     }
 
-    // テスト用：ブラウザからウェルカムメール送信を確認する
-    // 例: /test-welcome?email=you@example.com&name=テスト太郎&plan=standard
     if (url.pathname === "/test-welcome" && request.method === "GET") {
       const email          = url.searchParams.get("email");
       const name           = url.searchParams.get("name") ?? "テストユーザー";
-      const plan           = url.searchParams.get("plan") ?? "standard";
+      const planKey        = url.searchParams.get("plan") ?? "standard";
       const subscriptionId = `test-${Date.now()}`;
 
       if (!email) {
         return json({ error: "emailパラメータが必要です。例: /test-welcome?email=you@example.com" }, 400);
       }
 
+      const planLabel = await getPlanLabel(env, planKey);
       const debug = { steps: [] };
-      await sendWelcomeEmail(env, { email, name, plan, subscriptionId }, debug);
-      await sendAdminNotification(env, { email, name, plan, subscriptionId }, debug);
+      await sendWelcomeEmail(env, { email, name, plan: planKey, subscriptionId }, debug);
+      await sendAdminNotification(env, { email, name, planLabel, subscriptionId }, debug);
 
-      return json({ ok: true, sentTo: email, name, plan, subscriptionId, debug });
+      return json({ ok: true, sentTo: email, name, planKey, planLabel, subscriptionId, debug });
     }
 
     return json({ error: "not_found" }, 404);
