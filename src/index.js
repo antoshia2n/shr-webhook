@@ -381,6 +381,7 @@ export default {
 
       const debug = { steps: [] };
       await sendWelcomeEmail(env, { email, name, plan, subscriptionId }, debug);
+      await sendAdminNotification(env, { email, name, plan, subscriptionId }, debug);
 
       return json({ ok: true, sentTo: email, name, plan, subscriptionId, debug });
     }
