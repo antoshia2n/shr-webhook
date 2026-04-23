@@ -28,11 +28,15 @@ async function supabase(env, method, path, body) {
 
 // UnivaPayのトランザクショントークンからemailを取得
 async function getEmailFromUnivaPay(env, tokenId) {
+  const secret = (env.UNIVA_APP_SECRET ?? "").trim();
+  const token  = (env.UNIVA_APP_TOKEN ?? "").trim();
+  const storeId = (env.UNIVA_STORE_ID ?? "").trim();
   const res = await fetch(
-    `https://api.univapay.com/stores/${env.UNIVA_STORE_ID}/tokens/${tokenId}`,
+    `https://api.univapay.com/stores/${storeId}/tokens/${tokenId}`,
     {
       headers: {
-        "Authorization": `Bearer ${env.UNIVA_APP_TOKEN}.${env.UNIVA_APP_SECRET}`,
+        // UnivaPayの正しい形式: Bearer {secret}.{jwt}
+        "Authorization": `Bearer ${secret}.${token}`,
         "Content-Type": "application/json",
       },
     }
@@ -213,9 +217,12 @@ export default {
 
       // UnivaPayのAPI疎通テスト
       try {
+        const secret  = (env.UNIVA_APP_SECRET ?? "").trim();
+        const token   = (env.UNIVA_APP_TOKEN ?? "").trim();
+        const storeId = (env.UNIVA_STORE_ID ?? "").trim();
         const uniRes = await fetch(
-          `https://api.univapay.com/stores/${env.UNIVA_STORE_ID}`,
-          { headers: { "Authorization": `Bearer ${env.UNIVA_APP_TOKEN}.${env.UNIVA_APP_SECRET}` } }
+          `https://api.univapay.com/stores/${storeId}`,
+          { headers: { "Authorization": `Bearer ${secret}.${token}` } }
         );
         const uniText = await uniRes.text();
         diag.univapay_ping = { ok: uniRes.ok, status: uniRes.status, body: uniText.substring(0, 300) };
