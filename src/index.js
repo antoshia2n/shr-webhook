@@ -157,6 +157,137 @@ async function sendAdminNotification(env, { email, name, plan, subscriptionId },
   }
 }
 
+
+// 汎用メール送信ヘルパー
+// text の改行を <br> に変換して HTML も生成する（文字化け防止）
+async function sendEmail(env, { to, subject, text }) {
+  const resendKey = (env.RESEND_API_KEY    ?? "").trim();
+  const fromEmail = (env.RESEND_FROM_EMAIL ?? "").trim();
+  if (!resendKey || !fromEmail) return { ok: false, reason: "env_missing" };
+
+  const html = `<!DOCTYPE html>
+<html lang="ja">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="font-family:'Hiragino Sans','Noto Sans JP',sans-serif;font-size:14px;color:#1A1A1A;line-height:1.8;padding:24px;">
+${text.split("\n").map(line => line === "" ? "<br>" : `<p style="margin:0">${line}</p>`).join("\n")}
+</body></html>`;
+
+  try {
+    const res = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${resendKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ from: fromEmail, to: [to], subject, text, html }),
+    });
+    const data = await res.json();
+    return { ok: res.ok, status: res.status, messageId: data.id };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+// 月次領収メール（subscription_payment）
+async function sendReceiptEmail(env, member, debug) {
+  if (!member?.email || member.email.startsWith("pending_")) {
+    debug.steps.push({ step: "receiptEmail", skipped: "no_valid_email" });
+    return;
+  }
+  const planLabel = member.plan === "premium" ? "プレミアム" : "スタンダード";
+  const now = new Date().toLocaleString("ja-JP", { timeZone: "Asia/Tokyo" });
+  const result = await sendEmail(env, {
+    to: member.email,
+    subject: `【しあらぼNEXT】月次更新のご案内（${planLabel}）`,
+    text: [
+      `${member.name ?? "会員"} さん`,
+      ``,
+      `しあらぼNEXT（${planLabel}）の月次更新が完了しました。`,
+      `引き続きご利用いただけます。`,
+      ``,
+      `更新日時：${now}`,
+      `プラン：${planLabel}`,
+      ``,
+      `ポータル：https://portal.shia2n.jp`,
+      ``,
+      `ご不明な点は https://shia2n.jp よりお問い合わせください。`,
+    ].join("\n"),
+  });
+  debug.steps.push({ step: "receiptEmail", ...result });
+}
+
+// 決済失敗通知（subscription_failed）— ユーザー向け
+async function sendFailureEmailToUser(env, member, debug) {
+  if (!member?.email || member.email.startsWith("pending_")) {
+    debug.steps.push({ step: "failureEmailUser", skipped: "no_valid_email" });
+    return;
+  }
+  const planLabel = member.plan === "premium" ? "プレミアム" : "スタンダード";
+  const result = await sendEmail(env, {
+    to: member.email,
+    subject: `【しあらぼNEXT】決済処理に失敗しました`,
+    text: [
+      `${member.name ?? "会員"} さん`,
+      ``,
+      `しあらぼNEXT（${planLabel}）の月次決済処理に失敗しました。`,
+      `お支払い情報をご確認のうえ、サポートまでご連絡ください。`,
+      ``,
+      `サポート：https://shia2n.jp`,
+      ``,
+      `このまま解決しない場合、サービスのご利用が一時停止される場合があります。`,
+    ].join("\n"),
+  });
+  debug.steps.push({ step: "failureEmailUser", ...result });
+}
+
+// 決済失敗通知（subscription_failed）— Naoki向け
+async function sendFailureEmailToAdmin(env, member, debug) {
+  const notifyEmail = (env.NAOKI_NOTIFY_EMAIL ?? "").trim();
+  if (!notifyEmail) {
+    debug.steps.push({ step: "failureEmailAdmin", skipped: "env_missing" });
+    return;
+  }
+  const planLabel = member?.plan === "premium" ? "プレミアム" : "スタンダード";
+  const result = await sendEmail(env, {
+    to: notifyEmail,
+    subject: `【しあらぼNEXT】決済失敗：${member?.name ?? "不明"} (${planLabel})`,
+    text: [
+      `決済失敗が発生しました。`,
+      ``,
+      `名前：${member?.name ?? "不明"}`,
+      `メール：${member?.email ?? "不明"}`,
+      `プラン：${planLabel}`,
+      `サブスクID：${member?.univa_subscription_id ?? "不明"}`,
+      ``,
+      `Supabase確認：https://supabase.com/dashboard/project/htzadzpckcpdrmpjvaut/editor`,
+    ].join("\n"),
+  });
+  debug.steps.push({ step: "failureEmailAdmin", ...result });
+}
+
+// 解約完了メール（subscription_canceled）
+async function sendCancellationEmail(env, member, debug) {
+  if (!member?.email || member.email.startsWith("pending_")) {
+    debug.steps.push({ step: "cancellationEmail", skipped: "no_valid_email" });
+    return;
+  }
+  const planLabel = member.plan === "premium" ? "プレミアム" : "スタンダード";
+  const result = await sendEmail(env, {
+    to: member.email,
+    subject: `【しあらぼNEXT】解約が完了しました`,
+    text: [
+      `${member.name ?? "会員"} さん`,
+      ``,
+      `しあらぼNEXT（${planLabel}）の解約が完了しました。`,
+      `これまでご利用いただきありがとうございました。`,
+      ``,
+      `再入会をご希望の場合は以下からお手続きください。`,
+      `https://shia2n.jp`,
+    ].join("\n"),
+  });
+  debug.steps.push({ step: "cancellationEmail", ...result });
+}
+
 async function handleEvent(env, event, payload, debug = { steps: [] }) {
   const subscriptionId =
     payload?.data?.subscription_id ??
@@ -228,12 +359,15 @@ async function handleEvent(env, event, payload, debug = { steps: [] }) {
         subscription_status: "active",
         next_billing_date: nextDate.toISOString().split("T")[0],
       });
+      await sendReceiptEmail(env, member, debug);
       break;
     }
 
     case "subscription_failed": {
       if (!member) break;
       await updateMemberById(env, member.id, { subscription_status: "past_due" });
+      await sendFailureEmailToUser(env, member, debug);
+      await sendFailureEmailToAdmin(env, member, debug);
       break;
     }
 
@@ -243,6 +377,7 @@ async function handleEvent(env, event, payload, debug = { steps: [] }) {
         subscription_status: "canceled",
         canceled_at: new Date().toISOString(),
       });
+      await sendCancellationEmail(env, member, debug);
       break;
     }
   }
