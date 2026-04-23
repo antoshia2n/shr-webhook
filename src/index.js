@@ -26,6 +26,22 @@ async function supabase(env, method, path, body) {
   return { ok: res.ok, status: res.status, data: text ? JSON.parse(text) : null };
 }
 
+// UnivaPayのトランザクショントークンからemailを取得
+async function getEmailFromUnivaPay(env, tokenId) {
+  const res = await fetch(
+    `https://api.univapay.com/stores/${env.UNIVA_STORE_ID}/tokens/${tokenId}`,
+    {
+      headers: {
+        "Authorization": `Bearer ${env.UNIVA_APP_TOKEN}.${env.UNIVA_APP_SECRET}`,
+        "Content-Type": "application/json",
+      },
+    }
+  );
+  if (!res.ok) return null;
+  const data = await res.json();
+  return data?.email ?? null;
+}
+
 // subscription_id で会員を検索
 async function findMemberBySubscriptionId(env, subscriptionId) {
   const { data } = await supabase(env, "GET",
@@ -81,14 +97,22 @@ async function handleEvent(env, event, payload, debug = { steps: [] }) {
       const meta = payload?.data?.metadata ?? {};
       const name = meta["univapay-name"] ?? null;
       const plan = meta["plan"] ?? "standard";
+      const tokenId = payload?.data?.transaction_token_id;
+
+      // UnivaPayのAPIからemail取得
+      const email = tokenId
+        ? await getEmailFromUnivaPay(env, tokenId)
+        : null;
+
+      debug.steps.push({ step: "getEmail", email: email ?? "取得失敗" });
 
       if (!member) {
         const createResult = await supabase(env, "POST", "/shr_members", {
           user_id: env.DEFAULT_USER_ID,
-          email: `pending_${subscriptionId}@shia2n.jp`, // 仮メール（後で管理画面から更新）
+          email: email ?? `pending_${subscriptionId}@shia2n.jp`,
           name,
           plan,
-          subscription_status: "active",
+          subscription_status: "pending", // portal紐づけ後にactiveへ
           univa_subscription_id: subscriptionId,
           enrolled_at: new Date().toISOString(),
         });
@@ -153,6 +177,9 @@ export default {
           SUPABASE_URL: env.SUPABASE_URL ? "set" : "MISSING",
           SUPABASE_ANON_KEY: env.SUPABASE_ANON_KEY ? `set (length=${env.SUPABASE_ANON_KEY.length})` : "MISSING",
           DEFAULT_USER_ID: env.DEFAULT_USER_ID ? `set (${env.DEFAULT_USER_ID.substring(0, 8)}...)` : "MISSING",
+          UNIVA_APP_TOKEN: env.UNIVA_APP_TOKEN ? `set (${env.UNIVA_APP_TOKEN.substring(0, 8)}...)` : "MISSING",
+          UNIVA_APP_SECRET: env.UNIVA_APP_SECRET ? `set (length=${env.UNIVA_APP_SECRET.length})` : "MISSING",
+          UNIVA_STORE_ID: env.UNIVA_STORE_ID ? `set (${env.UNIVA_STORE_ID.substring(0, 8)}...)` : "MISSING",
         },
       };
 
