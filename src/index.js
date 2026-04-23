@@ -44,7 +44,7 @@ async function updateMemberById(env, id, fields) {
 
 // 課金ログ保存
 async function logBilling(env, memberId, eventType, payload) {
-  await supabase(env, "POST", "/shr_billing_logs", {
+  return await supabase(env, "POST", "/shr_billing_logs", {
     member_id: memberId ?? null,
     event_type: eventType,
     amount: payload?.data?.charged_amount ?? payload?.data?.amount ?? null,
@@ -54,18 +54,24 @@ async function logBilling(env, memberId, eventType, payload) {
   });
 }
 
-async function handleEvent(env, event, payload) {
+async function handleEvent(env, event, payload, debug = { steps: [] }) {
   // subscription_id を取得（イベント種別によって場所が違う）
   const subscriptionId =
     payload?.data?.subscription_id ?? // charge_finished
     payload?.data?.id;                // subscription_payment / failed / canceled
 
+  debug.subscriptionId = subscriptionId;
+
   const member = subscriptionId
     ? await findMemberBySubscriptionId(env, subscriptionId)
     : null;
 
+  debug.memberFound = !!member;
+  debug.memberId = member?.id ?? null;
+
   // 課金ログは常に保存
-  await logBilling(env, member?.id ?? null, event, payload);
+  const logResult = await logBilling(env, member?.id ?? null, event, payload);
+  debug.steps.push({ step: "logBilling", result: logResult });
 
   switch (event) {
 
@@ -77,7 +83,7 @@ async function handleEvent(env, event, payload) {
       const plan = meta["plan"] ?? "standard";
 
       if (!member) {
-        await supabase(env, "POST", "/shr_members", {
+        const createResult = await supabase(env, "POST", "/shr_members", {
           user_id: env.DEFAULT_USER_ID,
           email: `pending_${subscriptionId}@shia2n.jp`, // 仮メール（後で管理画面から更新）
           name,
@@ -86,6 +92,7 @@ async function handleEvent(env, event, payload) {
           univa_subscription_id: subscriptionId,
           enrolled_at: new Date().toISOString(),
         });
+        debug.steps.push({ step: "createMember", result: createResult });
       } else {
         await updateMemberById(env, member.id, {
           subscription_status: "active",
@@ -150,14 +157,15 @@ export default {
       const event = payload?.event;
       if (!event) return json({ error: "no_event" }, 400);
 
+      const debug = { event, steps: [] };
       try {
-        await handleEvent(env, event, payload);
+        await handleEvent(env, event, payload, debug);
       } catch (err) {
         console.error("[shr-webhook] error:", err.message);
-        return json({ ok: false, error: err.message });
+        return json({ ok: false, error: err.message, stack: err.stack, debug });
       }
 
-      return json({ ok: true, event });
+      return json({ ok: true, event, debug });
     }
 
     return json({ error: "not_found" }, 404);

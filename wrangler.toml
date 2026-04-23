@@ -2,5 +2,5 @@ name = "shr-webhook"
 main = "src/index.js"
 compatibility_date = "2024-01-01"
 
-[vars]
-# ランタイム変数は Bindings タブで設定する（このファイルには書かない）
+[observability]
+enabled = true
