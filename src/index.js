@@ -72,6 +72,7 @@ async function handleEvent(env, event, payload) {
           user_id: env.DEFAULT_USER_ID,
           email,
           name: payload?.data?.metadata?.name ?? null,
+          plan: payload?.data?.metadata?.plan ?? "standard",
           subscription_status: "active",
           univa_subscription_id: payload?.data?.subscription_id ?? null,
           enrolled_at: new Date().toISOString(),
