@@ -4,3 +4,7 @@ compatibility_date = "2024-01-01"
 
 [observability]
 enabled = true
+
+[vars]
+SUPABASE_URL = "https://htzadzpckcpdrmpjvaut.supabase.co"
+DEFAULT_USER_ID = "VrMwzeSceqWeXVQOrm8kpu4uVR33"
