@@ -111,6 +111,52 @@ async function sendWelcomeEmail(env, { email, name, plan, subscriptionId }, debu
   }
 }
 
+
+// Naokiへの新規入会通知メール
+async function sendAdminNotification(env, { email, name, plan, subscriptionId }, debug) {
+  const resendKey   = (env.RESEND_API_KEY    ?? "").trim();
+  const fromEmail   = (env.RESEND_FROM_EMAIL ?? "").trim();
+  const notifyEmail = (env.NAOKI_NOTIFY_EMAIL ?? "").trim();
+
+  if (!resendKey || !fromEmail || !notifyEmail) {
+    debug.steps.push({ step: "adminNotify", skipped: "env_missing" });
+    return;
+  }
+
+  const planLabel = plan === "premium" ? "プレミアム" : "スタンダード";
+  const now = new Date().toLocaleString("ja-JP", { timeZone: "Asia/Tokyo" });
+
+  try {
+    const res = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${resendKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        from: fromEmail,
+        to: [notifyEmail],
+        subject: `【しあらぼNEXT】新規入会：${name ?? "不明"} (${planLabel})`,
+        text: [
+          `新規入会がありました。`,
+          ``,
+          `名前：${name ?? "不明"}`,
+          `メール：${email ?? "取得失敗"}`,
+          `プラン：${planLabel}`,
+          `サブスクID：${subscriptionId}`,
+          `日時：${now}`,
+          ``,
+          `Supabase確認：https://supabase.com/dashboard/project/htzadzpckcpdrmpjvaut/editor`,
+        ].join("\n"),
+      }),
+    });
+    const data = await res.json();
+    debug.steps.push({ step: "adminNotify", ok: res.ok, status: res.status, messageId: data.id });
+  } catch (e) {
+    debug.steps.push({ step: "adminNotify", error: e.message });
+  }
+}
+
 async function handleEvent(env, event, payload, debug = { steps: [] }) {
   const subscriptionId =
     payload?.data?.subscription_id ??
@@ -160,6 +206,8 @@ async function handleEvent(env, event, payload, debug = { steps: [] }) {
         // 新規会員にウェルカムメールを送信
         if (createResult.ok) {
           await sendWelcomeEmail(env, { email, name, plan, subscriptionId }, debug);
+          // Naokiに入会通知
+          await sendAdminNotification(env, { email, name, plan, subscriptionId }, debug);
         }
       } else {
         await updateMemberById(env, member.id, {
