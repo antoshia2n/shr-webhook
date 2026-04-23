@@ -8,3 +8,4 @@ enabled = true
 [vars]
 SUPABASE_URL = "https://htzadzpckcpdrmpjvaut.supabase.co"
 DEFAULT_USER_ID = "VrMwzeSceqWeXVQOrm8kpu4uVR33"
+HIGH_SHIN_API_BASE = "https://high-shin.shia2n.jp"

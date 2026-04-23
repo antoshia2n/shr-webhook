@@ -28,14 +28,13 @@ async function supabase(env, method, path, body) {
 
 // UnivaPayのトランザクショントークンからemailを取得
 async function getEmailFromUnivaPay(env, tokenId) {
-  const secret = (env.UNIVA_APP_SECRET ?? "").trim();
-  const token  = (env.UNIVA_APP_TOKEN ?? "").trim();
+  const secret  = (env.UNIVA_APP_SECRET ?? "").trim();
+  const token   = (env.UNIVA_APP_TOKEN ?? "").trim();
   const storeId = (env.UNIVA_STORE_ID ?? "").trim();
   const res = await fetch(
     `https://api.univapay.com/stores/${storeId}/tokens/${tokenId}`,
     {
       headers: {
-        // UnivaPayの正しい形式: Bearer {secret}.{jwt}
         "Authorization": `Bearer ${secret}.${token}`,
         "Content-Type": "application/json",
       },
@@ -74,6 +73,44 @@ async function logBilling(env, memberId, eventType, payload) {
   });
 }
 
+// High-Shinくんのウェルカムメール送信を依頼
+async function sendWelcomeEmail(env, { email, name, plan, subscriptionId }, debug) {
+  // pending_ プレースホルダーの場合はスキップ
+  if (!email || email.startsWith("pending_")) {
+    debug.steps.push({ step: "sendWelcome", skipped: "no_valid_email" });
+    return;
+  }
+
+  const base   = (env.HIGH_SHIN_API_BASE ?? "").trim();
+  const secret = (env.HIGH_SHIN_INTERNAL_SECRET ?? "").trim();
+
+  if (!base || !secret) {
+    debug.steps.push({ step: "sendWelcome", skipped: "env_missing" });
+    return;
+  }
+
+  try {
+    const res = await fetch(`${base}/api/internal/send-welcome`, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${secret}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ email, name, plan, subscriptionId }),
+    });
+    const text = await res.text();
+    debug.steps.push({
+      step: "sendWelcome",
+      ok: res.ok,
+      status: res.status,
+      body: text.substring(0, 200),
+    });
+  } catch (e) {
+    // メール送信失敗はWebhook全体を失敗させない
+    debug.steps.push({ step: "sendWelcome", error: e.message });
+  }
+}
+
 async function handleEvent(env, event, payload, debug = { steps: [] }) {
   const subscriptionId =
     payload?.data?.subscription_id ??
@@ -95,12 +132,11 @@ async function handleEvent(env, event, payload, debug = { steps: [] }) {
 
     case "charge_finished": {
       if (payload?.data?.status !== "successful") break;
-      const meta = payload?.data?.metadata ?? {};
-      const name = meta["univapay-name"] ?? null;
-      const plan = meta["plan"] ?? "standard";
+      const meta    = payload?.data?.metadata ?? {};
+      const name    = meta["univapay-name"] ?? null;
+      const plan    = meta["plan"] ?? "standard";
       const tokenId = payload?.data?.transaction_token_id;
 
-      // emailを取得（失敗してもメンバー登録は続ける）
       let email = null;
       try {
         email = tokenId ? await getEmailFromUnivaPay(env, tokenId) : null;
@@ -120,6 +156,11 @@ async function handleEvent(env, event, payload, debug = { steps: [] }) {
           enrolled_at: new Date().toISOString(),
         });
         debug.steps.push({ step: "createMember", ok: createResult.ok, status: createResult.status, data: createResult.data });
+
+        // 新規会員にウェルカムメールを送信
+        if (createResult.ok) {
+          await sendWelcomeEmail(env, { email, name, plan, subscriptionId }, debug);
+        }
       } else {
         await updateMemberById(env, member.id, {
           subscription_status: "active",
@@ -167,21 +208,21 @@ export default {
       return new Response(null, { status: 204, headers: CORS });
     }
 
-    // ヘルスチェック
     if (url.pathname === "/health") {
       return json({ ok: true });
     }
 
-    // 診断エンドポイント
     if (url.pathname === "/diag") {
       const diag = {
         env_check: {
-          SUPABASE_URL: env.SUPABASE_URL ? "set" : "MISSING",
-          SUPABASE_ANON_KEY: env.SUPABASE_ANON_KEY ? `set (length=${env.SUPABASE_ANON_KEY.length})` : "MISSING",
-          DEFAULT_USER_ID: env.DEFAULT_USER_ID ? `set (${env.DEFAULT_USER_ID.substring(0, 8)}...)` : "MISSING",
-          UNIVA_APP_TOKEN: env.UNIVA_APP_TOKEN ? `set (${env.UNIVA_APP_TOKEN.substring(0, 8)}...)` : "MISSING",
-          UNIVA_APP_SECRET: env.UNIVA_APP_SECRET ? `set (length=${env.UNIVA_APP_SECRET.length})` : "MISSING",
-          UNIVA_STORE_ID: env.UNIVA_STORE_ID ? `set (${env.UNIVA_STORE_ID.substring(0, 8)}...)` : "MISSING",
+          SUPABASE_URL:             env.SUPABASE_URL             ? "set" : "MISSING",
+          SUPABASE_ANON_KEY:        env.SUPABASE_ANON_KEY        ? `set (length=${env.SUPABASE_ANON_KEY.length})` : "MISSING",
+          DEFAULT_USER_ID:          env.DEFAULT_USER_ID          ? `set (${env.DEFAULT_USER_ID.substring(0, 8)}...)` : "MISSING",
+          UNIVA_APP_TOKEN:          env.UNIVA_APP_TOKEN          ? `set (${env.UNIVA_APP_TOKEN.substring(0, 8)}...)` : "MISSING",
+          UNIVA_APP_SECRET:         env.UNIVA_APP_SECRET         ? `set (length=${env.UNIVA_APP_SECRET.length})` : "MISSING",
+          UNIVA_STORE_ID:           env.UNIVA_STORE_ID           ? `set (${env.UNIVA_STORE_ID.substring(0, 8)}...)` : "MISSING",
+          HIGH_SHIN_API_BASE:       env.HIGH_SHIN_API_BASE       ? `set (${env.HIGH_SHIN_API_BASE})` : "MISSING",
+          HIGH_SHIN_INTERNAL_SECRET: env.HIGH_SHIN_INTERNAL_SECRET ? `set (length=${env.HIGH_SHIN_INTERNAL_SECRET.length})` : "MISSING",
         },
       };
 
@@ -230,10 +271,32 @@ export default {
         diag.univapay_ping = { error: e.message };
       }
 
+      // High-Shin疎通テスト（/api/internal/send-welcome のヘルスチェック）
+      if (env.HIGH_SHIN_API_BASE && env.HIGH_SHIN_INTERNAL_SECRET) {
+        try {
+          const hsRes = await fetch(
+            `${env.HIGH_SHIN_API_BASE}/api/internal/send-welcome`,
+            {
+              method: "POST",
+              headers: {
+                "Authorization": `Bearer ${env.HIGH_SHIN_INTERNAL_SECRET}`,
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify({ ping: true }),
+            }
+          );
+          const hsText = await hsRes.text();
+          diag.high_shin_ping = { ok: hsRes.ok, status: hsRes.status, body: hsText.substring(0, 200) };
+        } catch (e) {
+          diag.high_shin_ping = { error: e.message };
+        }
+      } else {
+        diag.high_shin_ping = { skipped: "env_missing" };
+      }
+
       return json(diag);
     }
 
-    // UnivaPayのWebhook受信口
     if (url.pathname === "/univapay" && request.method === "POST") {
       let payload;
       try {
