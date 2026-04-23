@@ -11,7 +11,6 @@ function json(data, status = 200) {
   });
 }
 
-// Supabase REST API を fetch で直接叩く
 async function supabase(env, method, path, body) {
   const res = await fetch(`${env.SUPABASE_URL}/rest/v1${path}`, {
     method,
@@ -27,16 +26,18 @@ async function supabase(env, method, path, body) {
   return { ok: res.ok, status: res.status, data: text ? JSON.parse(text) : null };
 }
 
-// 会員をメールで検索
-async function findMemberByEmail(env, email) {
-  const { data } = await supabase(env, "GET", `/shr_members?email=eq.${encodeURIComponent(email)}&limit=1`);
+// subscription_id で会員を検索
+async function findMemberBySubscriptionId(env, subscriptionId) {
+  const { data } = await supabase(env, "GET",
+    `/shr_members?univa_subscription_id=eq.${subscriptionId}&limit=1`
+  );
   return Array.isArray(data) ? data[0] : null;
 }
 
 // 会員ステータス更新
-async function updateMember(env, email, fields) {
+async function updateMemberById(env, id, fields) {
   await supabase(env, "PATCH",
-    `/shr_members?email=eq.${encodeURIComponent(email)}`,
+    `/shr_members?id=eq.${id}`,
     { ...fields, updated_at: new Date().toISOString() }
   );
 }
@@ -46,41 +47,50 @@ async function logBilling(env, memberId, eventType, payload) {
   await supabase(env, "POST", "/shr_billing_logs", {
     member_id: memberId ?? null,
     event_type: eventType,
-    amount: payload?.data?.charged_amount ?? null,
-    currency: payload?.data?.charged_currency ?? "JPY",
+    amount: payload?.data?.charged_amount ?? payload?.data?.amount ?? null,
+    currency: payload?.data?.charged_currency ?? payload?.data?.currency ?? "JPY",
     univa_charge_id: payload?.data?.id ?? null,
     raw_payload: payload,
   });
 }
 
-// イベント別処理
 async function handleEvent(env, event, payload) {
-  const email = payload?.data?.email;
-  const member = email ? await findMemberByEmail(env, email) : null;
+  // subscription_id を取得（イベント種別によって場所が違う）
+  const subscriptionId =
+    payload?.data?.subscription_id ?? // charge_finished
+    payload?.data?.id;                // subscription_payment / failed / canceled
+
+  const member = subscriptionId
+    ? await findMemberBySubscriptionId(env, subscriptionId)
+    : null;
 
   // 課金ログは常に保存
   await logBilling(env, member?.id ?? null, event, payload);
 
   switch (event) {
 
-    // 初回入会完了（単発課金 + サブスク開始）
+    // 初回課金完了 → 新規会員作成 or アクティブ化
     case "charge_finished": {
       if (payload?.data?.status !== "successful") break;
+      const meta = payload?.data?.metadata ?? {};
+      const name = meta["univapay-name"] ?? null;
+      const plan = meta["plan"] ?? "standard";
+
       if (!member) {
-        // 新規会員として登録
         await supabase(env, "POST", "/shr_members", {
           user_id: env.DEFAULT_USER_ID,
-          email,
-          name: payload?.data?.metadata?.name ?? null,
-          plan: payload?.data?.metadata?.plan ?? "standard",
+          email: `pending_${subscriptionId}@shia2n.jp`, // 仮メール（後で管理画面から更新）
+          name,
+          plan,
           subscription_status: "active",
-          univa_subscription_id: payload?.data?.subscription_id ?? null,
+          univa_subscription_id: subscriptionId,
           enrolled_at: new Date().toISOString(),
         });
       } else {
-        await updateMember(env, email, {
+        await updateMemberById(env, member.id, {
           subscription_status: "active",
-          enrolled_at: member.enrolled_at ?? new Date().toISOString(),
+          name: name ?? member.name,
+          plan: plan ?? member.plan,
         });
       }
       break;
@@ -91,7 +101,7 @@ async function handleEvent(env, event, payload) {
       if (!member) break;
       const nextDate = new Date();
       nextDate.setMonth(nextDate.getMonth() + 1);
-      await updateMember(env, email, {
+      await updateMemberById(env, member.id, {
         subscription_status: "active",
         next_billing_date: nextDate.toISOString().split("T")[0],
       });
@@ -101,14 +111,14 @@ async function handleEvent(env, event, payload) {
     // 課金失敗
     case "subscription_failed": {
       if (!member) break;
-      await updateMember(env, email, { subscription_status: "past_due" });
+      await updateMemberById(env, member.id, { subscription_status: "past_due" });
       break;
     }
 
     // 解約
     case "subscription_canceled": {
       if (!member) break;
-      await updateMember(env, email, {
+      await updateMemberById(env, member.id, {
         subscription_status: "canceled",
         canceled_at: new Date().toISOString(),
       });
@@ -121,17 +131,14 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
-    // プリフライト
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: CORS });
     }
 
-    // ヘルスチェック
     if (url.pathname === "/health") {
       return json({ ok: true });
     }
 
-    // UnivaPayのWebhook受信口
     if (url.pathname === "/univapay" && request.method === "POST") {
       let payload;
       try {
@@ -143,14 +150,10 @@ export default {
       const event = payload?.event;
       if (!event) return json({ error: "no_event" }, 400);
 
-      // 3秒以内にレスポンスを返す（UnivaPayの仕様）
-      // 処理はバックグラウンドで実行
-      const ctx = { waitUntil: (p) => p }; // Workers環境では自動的に処理される
       try {
         await handleEvent(env, event, payload);
       } catch (err) {
         console.error("[shr-webhook] error:", err.message);
-        // エラーでも200を返す（UnivaPayのリトライ防止）
         return json({ ok: false, error: err.message });
       }
 
