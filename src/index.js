@@ -53,10 +53,7 @@ async function findMemberBySubscriptionId(env, subscriptionId) {
   return Array.isArray(data) ? data[0] : null;
 }
 
-// -----------------------------------------------------------------------
 // pay_products テーブルから plan_key に対応する商品情報を取得
-// 戻り値: { name, payment_status } | null
-// -----------------------------------------------------------------------
 async function lookupProduct(env, planKey) {
   const res = await fetch(
     `${env.SUPABASE_URL}/rest/v1/pay_products` +
@@ -75,15 +72,11 @@ async function lookupProduct(env, planKey) {
   return rows?.[0] ?? null;
 }
 
-// plan_key から表示名を返す（DB参照、見つからなければ plan_key をそのまま返す）
 async function getPlanLabel(env, planKey) {
   const product = await lookupProduct(env, planKey ?? "standard");
   return product?.name ?? planKey ?? "スタンダード";
 }
 
-// -----------------------------------------------------------------------
-
-// 会員ステータス更新
 async function updateMemberById(env, id, fields) {
   await supabase(env, "PATCH",
     `/shr_members?id=eq.${id}`,
@@ -91,7 +84,6 @@ async function updateMemberById(env, id, fields) {
   );
 }
 
-// 課金ログ保存
 async function logBilling(env, memberId, eventType, payload) {
   return await supabase(env, "POST", "/shr_billing_logs", {
     member_id: memberId ?? null,
@@ -103,7 +95,6 @@ async function logBilling(env, memberId, eventType, payload) {
   });
 }
 
-// High-Shinくんのウェルカムメール送信を依頼
 async function sendWelcomeEmail(env, { email, name, plan, subscriptionId }, debug) {
   if (!email || email.startsWith("pending_")) {
     debug.steps.push({ step: "sendWelcome", skipped: "no_valid_email" });
@@ -139,7 +130,6 @@ async function sendWelcomeEmail(env, { email, name, plan, subscriptionId }, debu
   }
 }
 
-// Naokiへの新規入会通知メール
 async function sendAdminNotification(env, { email, name, planLabel, subscriptionId }, debug) {
   const resendKey   = (env.RESEND_API_KEY    ?? "").trim();
   const fromEmail   = (env.RESEND_FROM_EMAIL ?? "").trim();
@@ -183,7 +173,6 @@ async function sendAdminNotification(env, { email, name, planLabel, subscription
   }
 }
 
-// 汎用メール送信ヘルパー
 async function sendEmail(env, { to, subject, text }) {
   const resendKey = (env.RESEND_API_KEY    ?? "").trim();
   const fromEmail = (env.RESEND_FROM_EMAIL ?? "").trim();
@@ -212,7 +201,6 @@ ${text.split("\n").map(line => line === "" ? "<br>" : `<p style="margin:0">${lin
   }
 }
 
-// 月次領収メール（subscription_payment）
 async function sendReceiptEmail(env, member, debug) {
   if (!member?.email || member.email.startsWith("pending_")) {
     debug.steps.push({ step: "receiptEmail", skipped: "no_valid_email" });
@@ -240,7 +228,6 @@ async function sendReceiptEmail(env, member, debug) {
   debug.steps.push({ step: "receiptEmail", ...result });
 }
 
-// 決済失敗通知（subscription_failed）— ユーザー向け
 async function sendFailureEmailToUser(env, member, debug) {
   if (!member?.email || member.email.startsWith("pending_")) {
     debug.steps.push({ step: "failureEmailUser", skipped: "no_valid_email" });
@@ -264,7 +251,6 @@ async function sendFailureEmailToUser(env, member, debug) {
   debug.steps.push({ step: "failureEmailUser", ...result });
 }
 
-// 決済失敗通知（subscription_failed）— Naoki向け
 async function sendFailureEmailToAdmin(env, member, debug) {
   const notifyEmail = (env.NAOKI_NOTIFY_EMAIL ?? "").trim();
   if (!notifyEmail) {
@@ -289,7 +275,6 @@ async function sendFailureEmailToAdmin(env, member, debug) {
   debug.steps.push({ step: "failureEmailAdmin", ...result });
 }
 
-// 解約完了メール（subscription_canceled）
 async function sendCancellationEmail(env, member, debug) {
   if (!member?.email || member.email.startsWith("pending_")) {
     debug.steps.push({ step: "cancellationEmail", skipped: "no_valid_email" });
@@ -338,13 +323,11 @@ async function handleEvent(env, event, payload, debug = { steps: [] }) {
       const planKey = meta["plan"] ?? "standard";
       const tokenId = payload?.data?.transaction_token_id;
 
-      // pay_products テーブルから商品情報を取得
       const product = await lookupProduct(env, planKey);
       if (!product) {
         const errMsg = `unknown plan_key: ${planKey}`;
         console.error(`[shr-webhook] ${errMsg}`);
         debug.steps.push({ step: "lookupProduct", error: errMsg });
-        // 商品が見つからなくても処理は継続する（fallback）
       }
       const planLabel     = product?.name           ?? planKey;
       const paymentStatus = product?.payment_status ?? "basic";
@@ -417,6 +400,166 @@ async function handleEvent(env, event, payload, debug = { steps: [] }) {
   }
 }
 
+// ─────────────────────────────────────────────
+// 毎朝9時（0:00 UTC）の自動イベント通知
+// ─────────────────────────────────────────────
+
+const EVENT_TYPE_LABEL = {
+  seminar:  "セミナー作業会",
+  special:  "特別セミナー",
+  offline:  "オフライン",
+  party:    "オンライン飲み会",
+  workshop: "作業・交流会",
+  other:    "その他",
+};
+
+const SEMINAR_SEND_TEMPLATE = (title, zoom) =>
+`🔥本日21時🔥
+【しあらぼセミナー作業会】
+
+今夜は
+「${title}」
+を開催します！
+
+必ずリアル参加して理解度を上げていきましょう！
+
+《Zoomリンク》
+${zoom || "https://us02web.zoom.us/j/9297844714"}
+
+ミーティングID: 929 784 4714`;
+
+function buildEventNotificationHtml(events, today) {
+  const rows = events.map(ev => {
+    const typeLabel = EVENT_TYPE_LABEL[ev.type] || ev.type;
+    const isSeminar = ev.type === "seminar" || ev.type === "special";
+
+    const zoomBlock = ev.zoom
+      ? `<p style="margin:8px 0 0;font-size:13px;">
+           Zoom: <a href="${ev.zoom}" style="color:#4B72FF;">${ev.zoom}</a>
+         </p>`
+      : "";
+
+    const templateBlock = isSeminar
+      ? `<div style="margin:12px 0 0;background:#F0F4FF;border-left:3px solid #4B72FF;padding:10px 14px;border-radius:0 6px 6px 0;">
+           <div style="font-size:10px;color:#4B72FF;font-weight:700;letter-spacing:1px;margin-bottom:8px;">配信テンプレ（コピーしてLINEへ）</div>
+           <pre style="margin:0;font-size:12px;color:#333;white-space:pre-wrap;font-family:monospace;">${SEMINAR_SEND_TEMPLATE(ev.title, ev.zoom)}</pre>
+         </div>`
+      : "";
+
+    return `
+      <div style="background:#fff;border:1px solid #E8E4DF;border-radius:8px;padding:16px;margin-bottom:12px;">
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
+          <span style="background:#EEF1FF;color:#4B72FF;border-radius:4px;padding:2px 10px;font-size:11px;font-weight:700;">${typeLabel}</span>
+          ${ev.time ? `<span style="font-size:12px;color:#888;">${ev.time}</span>` : ""}
+        </div>
+        <div style="font-size:17px;font-weight:800;color:#1A1A2E;">${ev.title}</div>
+        ${zoomBlock}
+        ${templateBlock}
+      </div>`;
+  }).join("");
+
+  return `<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>今日のイベント通知</title>
+</head>
+<body style="margin:0;padding:0;background:#F7F5F2;font-family:'Hiragino Sans','Noto Sans JP',sans-serif;">
+  <div style="max-width:560px;margin:0 auto;padding:24px 16px;">
+
+    <div style="background:linear-gradient(135deg,#1A1A2E 0%,#2D1B5E 100%);border-radius:12px 12px 0 0;padding:24px;">
+      <div style="font-size:10px;color:rgba(255,255,255,0.4);letter-spacing:2px;margin-bottom:6px;">SHIARABO ADMIN</div>
+      <div style="font-size:22px;font-weight:800;color:#fff;line-height:1.2;">今日のイベント通知</div>
+      <div style="font-size:13px;color:rgba(255,255,255,0.6);margin-top:6px;">${today}</div>
+    </div>
+
+    <div style="background:#F7F5F2;padding:20px;border:1px solid #E8E4DF;border-top:none;border-radius:0 0 12px 12px;">
+      ${rows}
+      <div style="text-align:center;margin-top:20px;">
+        <a href="https://admin.shia2n.jp"
+           style="display:inline-block;background:#4B72FF;color:#fff;border-radius:8px;padding:11px 28px;font-size:13px;font-weight:700;text-decoration:none;">
+          管理画面を開く
+        </a>
+      </div>
+    </div>
+
+    <div style="text-align:center;margin-top:12px;font-size:11px;color:#A8A4B0;">
+      毎朝9:00に自動送信 | しあらぼ管理システム
+    </div>
+  </div>
+</body>
+</html>`;
+}
+
+async function handleScheduled(event, env, ctx) {
+  // JST（UTC+9）で今日の日付を取得
+  const now   = new Date();
+  const jst   = new Date(now.getTime() + 9 * 60 * 60 * 1000);
+  const today = jst.toISOString().split("T")[0]; // "2025-06-18"
+
+  console.log(`[cron] 実行日: ${today}`);
+
+  // shr_events から今日のイベントを取得
+  const res = await fetch(
+    `${env.SUPABASE_URL}/rest/v1/shr_events?date=eq.${today}&select=*&order=time.asc`,
+    {
+      headers: {
+        "apikey":        env.SUPABASE_ANON_KEY,
+        "Authorization": `Bearer ${env.SUPABASE_ANON_KEY}`,
+      },
+    }
+  );
+
+  if (!res.ok) {
+    console.error(`[cron] Supabase fetch failed: ${res.status}`);
+    return;
+  }
+
+  const events = await res.json();
+  if (!Array.isArray(events) || events.length === 0) {
+    console.log(`[cron] ${today}: イベントなし、通知スキップ`);
+    return;
+  }
+
+  console.log(`[cron] ${today}: ${events.length}件のイベントを通知`);
+
+  const resendKey   = (env.RESEND_API_KEY     ?? "").trim();
+  const fromEmail   = (env.RESEND_FROM_EMAIL  ?? "").trim();
+  const notifyEmail = (env.NAOKI_NOTIFY_EMAIL ?? "").trim();
+
+  if (!resendKey || !fromEmail || !notifyEmail) {
+    console.error("[cron] Resend環境変数が未設定");
+    return;
+  }
+
+  const subject  = `【今日のイベント】${events.map(e => e.title).join(" / ")}`;
+  const html     = buildEventNotificationHtml(events, today);
+
+  const emailRes = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${resendKey}`,
+      "Content-Type":  "application/json",
+    },
+    body: JSON.stringify({
+      from: fromEmail,
+      to:   [notifyEmail],
+      subject,
+      html,
+    }),
+  });
+
+  if (emailRes.ok) {
+    console.log(`[cron] 通知メール送信完了: ${subject}`);
+  } else {
+    const err = await emailRes.text();
+    console.error(`[cron] Resend error: ${err}`);
+  }
+}
+
+// ─────────────────────────────────────────────
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -432,18 +575,19 @@ export default {
     if (url.pathname === "/diag") {
       const diag = {
         env_check: {
-          SUPABASE_URL:             env.SUPABASE_URL             ? "set" : "MISSING",
-          SUPABASE_ANON_KEY:        env.SUPABASE_ANON_KEY        ? `set (length=${env.SUPABASE_ANON_KEY.length})` : "MISSING",
-          DEFAULT_USER_ID:          env.DEFAULT_USER_ID          ? `set (${env.DEFAULT_USER_ID.substring(0, 8)}...)` : "MISSING",
-          UNIVA_APP_TOKEN:          env.UNIVA_APP_TOKEN          ? `set (${env.UNIVA_APP_TOKEN.substring(0, 8)}...)` : "MISSING",
-          UNIVA_APP_SECRET:         env.UNIVA_APP_SECRET         ? `set (length=${env.UNIVA_APP_SECRET.length})` : "MISSING",
-          UNIVA_STORE_ID:           env.UNIVA_STORE_ID           ? `set (${env.UNIVA_STORE_ID.substring(0, 8)}...)` : "MISSING",
-          HIGH_SHIN_API_BASE:       env.HIGH_SHIN_API_BASE       ? `set (${env.HIGH_SHIN_API_BASE})` : "MISSING",
+          SUPABASE_URL:              env.SUPABASE_URL              ? "set" : "MISSING",
+          SUPABASE_ANON_KEY:         env.SUPABASE_ANON_KEY         ? `set (length=${env.SUPABASE_ANON_KEY.length})` : "MISSING",
+          DEFAULT_USER_ID:           env.DEFAULT_USER_ID           ? `set (${env.DEFAULT_USER_ID.substring(0, 8)}...)` : "MISSING",
+          UNIVA_APP_TOKEN:           env.UNIVA_APP_TOKEN           ? `set (${env.UNIVA_APP_TOKEN.substring(0, 8)}...)` : "MISSING",
+          UNIVA_APP_SECRET:          env.UNIVA_APP_SECRET          ? `set (length=${env.UNIVA_APP_SECRET.length})` : "MISSING",
+          UNIVA_STORE_ID:            env.UNIVA_STORE_ID            ? `set (${env.UNIVA_STORE_ID.substring(0, 8)}...)` : "MISSING",
+          HIGH_SHIN_API_BASE:        env.HIGH_SHIN_API_BASE        ? `set (${env.HIGH_SHIN_API_BASE})` : "MISSING",
           HIGH_SHIN_INTERNAL_SECRET: env.HIGH_SHIN_INTERNAL_SECRET ? `set (length=${env.HIGH_SHIN_INTERNAL_SECRET.length})` : "MISSING",
+          RESEND_API_KEY:            env.RESEND_API_KEY            ? `set (length=${env.RESEND_API_KEY.length})` : "MISSING",
+          NAOKI_NOTIFY_EMAIL:        env.NAOKI_NOTIFY_EMAIL        ? `set (${env.NAOKI_NOTIFY_EMAIL})` : "MISSING",
         },
       };
 
-      // Supabase疎通テスト
       try {
         const ping = await supabase(env, "GET", "/shr_members?limit=1");
         diag.supabase_ping = { ok: ping.ok, status: ping.status };
@@ -451,7 +595,6 @@ export default {
         diag.supabase_ping = { error: e.message };
       }
 
-      // pay_products 疎通テスト（新規追加）
       try {
         const ping = await supabase(env, "GET", "/pay_products?limit=1");
         diag.pay_products_ping = { ok: ping.ok, status: ping.status, count: ping.data?.length ?? 0 };
@@ -459,7 +602,14 @@ export default {
         diag.pay_products_ping = { error: e.message };
       }
 
-      // lookupProduct 動作確認（standard）
+      // shr_events 疎通テスト（新規追加）
+      try {
+        const ping = await supabase(env, "GET", "/shr_events?limit=1");
+        diag.shr_events_ping = { ok: ping.ok, status: ping.status, count: ping.data?.length ?? 0 };
+      } catch (e) {
+        diag.shr_events_ping = { error: e.message };
+      }
+
       try {
         const product = await lookupProduct(env, "standard");
         diag.lookup_standard = product
@@ -469,7 +619,6 @@ export default {
         diag.lookup_standard = { error: e.message };
       }
 
-      // Supabase書き込みテスト
       try {
         const testId = `test-${Date.now()}`;
         const insert = await supabase(env, "POST", "/shr_members", {
@@ -491,7 +640,6 @@ export default {
         diag.test_insert = { error: e.message };
       }
 
-      // UnivaPayのAPI疎通テスト
       try {
         const secret  = (env.UNIVA_APP_SECRET ?? "").trim();
         const token   = (env.UNIVA_APP_TOKEN ?? "").trim();
@@ -506,7 +654,6 @@ export default {
         diag.univapay_ping = { error: e.message };
       }
 
-      // High-Shin疎通テスト
       if (env.HIGH_SHIN_API_BASE && env.HIGH_SHIN_INTERNAL_SECRET) {
         try {
           const hsRes = await fetch(
@@ -530,6 +677,16 @@ export default {
       }
 
       return json(diag);
+    }
+
+    // Cronテスト用エンドポイント（今日のイベント通知を手動実行）
+    if (url.pathname === "/test-cron" && request.method === "GET") {
+      try {
+        await handleScheduled({}, env, {});
+        return json({ ok: true, message: "Cron実行完了。メールを確認してください。" });
+      } catch (e) {
+        return json({ ok: false, error: e.message }, 500);
+      }
     }
 
     if (url.pathname === "/univapay" && request.method === "POST") {
@@ -574,4 +731,6 @@ export default {
 
     return json({ error: "not_found" }, 404);
   },
+
+  scheduled: handleScheduled,
 };
