@@ -130,6 +130,46 @@ async function sendWelcomeEmail(env, { email, name, plan, subscriptionId }, debu
   }
 }
 
+async function enrollToSequence(env, { email }, debug) {
+  if (!email || email.startsWith("pending_")) {
+    debug.steps.push({ step: "enrollToSequence", skipped: "no_valid_email" });
+    return;
+  }
+
+  const base   = (env.HIGH_SHIN_API_BASE ?? "").trim();
+  const secret = (env.HIGH_SHIN_INTERNAL_SECRET ?? "").trim();
+
+  if (!base || !secret) {
+    debug.steps.push({ step: "enrollToSequence", skipped: "env_missing" });
+    return;
+  }
+
+  try {
+    const res = await fetch(`${base}/api/internal/enroll-to-sequence`, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${secret}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        contact_email:        email,
+        sequence_trigger_key: "shr_member_created",
+        user_id:              env.DEFAULT_USER_ID,
+      }),
+    });
+    const text = await res.text();
+    debug.steps.push({
+      step:   "enrollToSequence",
+      ok:     res.ok,
+      status: res.status,
+      body:   text.substring(0, 200),
+    });
+  } catch (e) {
+    // enroll失敗は主処理（会員登録）を止めない
+    debug.steps.push({ step: "enrollToSequence", error: e.message });
+  }
+}
+
 async function sendAdminNotification(env, { email, name, planLabel, subscriptionId }, debug) {
   const resendKey   = (env.RESEND_API_KEY    ?? "").trim();
   const fromEmail   = (env.RESEND_FROM_EMAIL ?? "").trim();
@@ -355,6 +395,7 @@ async function handleEvent(env, event, payload, debug = { steps: [] }) {
 
         if (createResult.ok) {
           await sendWelcomeEmail(env, { email, name, plan: planKey, subscriptionId }, debug);
+          await enrollToSequence(env, { email }, debug);
           await sendAdminNotification(env, { email, name, planLabel, subscriptionId }, debug);
         }
       } else {
@@ -672,8 +713,27 @@ export default {
         } catch (e) {
           diag.high_shin_ping = { error: e.message };
         }
+
+        try {
+          const enrollRes = await fetch(
+            `${env.HIGH_SHIN_API_BASE}/api/internal/enroll-to-sequence`,
+            {
+              method: "POST",
+              headers: {
+                "Authorization": `Bearer ${env.HIGH_SHIN_INTERNAL_SECRET}`,
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify({ ping: true }),
+            }
+          );
+          const enrollText = await enrollRes.text();
+          diag.enroll_to_sequence_ping = { ok: enrollRes.ok, status: enrollRes.status, body: enrollText.substring(0, 200) };
+        } catch (e) {
+          diag.enroll_to_sequence_ping = { error: e.message };
+        }
       } else {
-        diag.high_shin_ping = { skipped: "env_missing" };
+        diag.high_shin_ping          = { skipped: "env_missing" };
+        diag.enroll_to_sequence_ping = { skipped: "env_missing" };
       }
 
       return json(diag);
