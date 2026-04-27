@@ -130,44 +130,101 @@ async function sendWelcomeEmail(env, { email, name, plan, subscriptionId }, debu
   }
 }
 
-async function enrollToSequence(env, { email }, debug) {
-  if (!email || email.startsWith("pending_")) {
-    debug.steps.push({ step: "enrollToSequence", skipped: "no_valid_email" });
-    return;
+// ─────────────────────────────────────────────
+// Pay-kun トリガーから呼ばれる外部 API 用のコア処理
+// POST /api/external/register-member から呼び出す
+// ─────────────────────────────────────────────
+async function registerMemberCore(env, {
+  pay_product_id,
+  customer_email,
+  customer_name,
+  pay_order_id,
+  amount,
+}) {
+  const result = { steps: [] };
+
+  // 1. email で shr_members を検索
+  let member = null;
+  if (customer_email && !customer_email.startsWith("pending_")) {
+    const { data } = await supabase(env, "GET",
+      `/shr_members?email=eq.${encodeURIComponent(customer_email)}&order=enrolled_at.desc&limit=1`
+    );
+    member = Array.isArray(data) ? data[0] : null;
   }
 
-  const base   = (env.HIGH_SHIN_API_BASE ?? "").trim();
-  const secret = (env.HIGH_SHIN_INTERNAL_SECRET ?? "").trim();
-
-  if (!base || !secret) {
-    debug.steps.push({ step: "enrollToSequence", skipped: "env_missing" });
-    return;
+  // 2. pay_products から plan_key・payment_status を取得
+  let product = null;
+  if (pay_product_id) {
+    const { data } = await supabase(env, "GET",
+      `/pay_products?id=eq.${pay_product_id}&active=eq.true&select=name,plan_key,payment_status&limit=1`
+    );
+    product = Array.isArray(data) ? data[0] : null;
   }
+  const planKey       = product?.plan_key       ?? "standard";
+  const paymentStatus = product?.payment_status ?? "basic";
+  const planLabel     = product?.name           ?? planKey;
 
-  try {
-    const res = await fetch(`${base}/api/internal/enroll-to-sequence`, {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${secret}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        contact_email:        email,
-        sequence_trigger_key: "shr_member_created",
-        user_id:              env.DEFAULT_USER_ID,
-      }),
+  result.steps.push({ step: "lookupProduct", planKey, paymentStatus, found: !!product });
+
+  let isNew = false;
+  let memberId = null;
+
+  if (!member) {
+    // 3a. 新規会員 INSERT
+    const createResult = await supabase(env, "POST", "/shr_members", {
+      user_id:               env.DEFAULT_USER_ID,
+      email:                 customer_email ?? `pending_${pay_order_id}@shia2n.jp`,
+      name:                  customer_name ?? null,
+      plan:                  planKey,
+      subscription_status:   "active",
+      enrolled_at:           new Date().toISOString(),
     });
-    const text = await res.text();
-    debug.steps.push({
-      step:   "enrollToSequence",
-      ok:     res.ok,
-      status: res.status,
-      body:   text.substring(0, 200),
+    isNew    = true;
+    memberId = Array.isArray(createResult.data) ? createResult.data[0]?.id : createResult.data?.id;
+    result.steps.push({ step: "createMember", ok: createResult.ok, memberId });
+
+    // 新規会員には enroll-to-sequence を呼ぶ（選択肢A: shr-webhook が直接呼ぶ）
+    const base   = (env.HIGH_SHIN_API_BASE ?? "").trim();
+    const secret = (env.HIGH_SHIN_INTERNAL_SECRET ?? "").trim();
+    if (base && secret && customer_email && !customer_email.startsWith("pending_")) {
+      try {
+        const enrollRes = await fetch(`${base}/api/internal/enroll-to-sequence`, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${secret}`, "Content-Type": "application/json" },
+          body: JSON.stringify({
+            contact_email:        customer_email,
+            sequence_trigger_key: "shr_member_created",
+            user_id:              env.DEFAULT_USER_ID,
+          }),
+        });
+        const enrollText = await enrollRes.text();
+        result.steps.push({ step: "enrollToSequence", ok: enrollRes.ok, status: enrollRes.status, body: enrollText.substring(0, 200) });
+      } catch (e) {
+        // enroll 失敗は会員登録自体を止めない
+        result.steps.push({ step: "enrollToSequence", error: e.message });
+      }
+    } else {
+      result.steps.push({ step: "enrollToSequence", skipped: "env_missing_or_no_email" });
+    }
+
+  } else {
+    // 3b. 既存会員 UPDATE（プラン変更等）
+    memberId = member.id;
+    await supabase(env, "PATCH", `/shr_members?id=eq.${member.id}`, {
+      subscription_status: "active",
+      plan:                planKey,
+      name:                customer_name ?? member.name,
+      updated_at:          new Date().toISOString(),
     });
-  } catch (e) {
-    // enroll失敗は主処理（会員登録）を止めない
-    debug.steps.push({ step: "enrollToSequence", error: e.message });
+    result.steps.push({ step: "updateMember", memberId: member.id });
   }
+
+  result.ok         = true;
+  result.isNew      = isNew;
+  result.memberId   = memberId;
+  result.planKey    = planKey;
+  result.planLabel  = planLabel;
+  return result;
 }
 
 async function sendAdminNotification(env, { email, name, planLabel, subscriptionId }, debug) {
@@ -395,7 +452,6 @@ async function handleEvent(env, event, payload, debug = { steps: [] }) {
 
         if (createResult.ok) {
           await sendWelcomeEmail(env, { email, name, plan: planKey, subscriptionId }, debug);
-          await enrollToSequence(env, { email }, debug);
           await sendAdminNotification(env, { email, name, planLabel, subscriptionId }, debug);
         }
       } else {
@@ -626,6 +682,7 @@ export default {
           HIGH_SHIN_INTERNAL_SECRET: env.HIGH_SHIN_INTERNAL_SECRET ? `set (length=${env.HIGH_SHIN_INTERNAL_SECRET.length})` : "MISSING",
           RESEND_API_KEY:            env.RESEND_API_KEY            ? `set (length=${env.RESEND_API_KEY.length})` : "MISSING",
           NAOKI_NOTIFY_EMAIL:        env.NAOKI_NOTIFY_EMAIL        ? `set (${env.NAOKI_NOTIFY_EMAIL})` : "MISSING",
+          SHR_EXTERNAL_SECRET:       env.SHR_EXTERNAL_SECRET       ? `set (length=${env.SHR_EXTERNAL_SECRET.length})` : "MISSING",
         },
       };
 
@@ -713,27 +770,8 @@ export default {
         } catch (e) {
           diag.high_shin_ping = { error: e.message };
         }
-
-        try {
-          const enrollRes = await fetch(
-            `${env.HIGH_SHIN_API_BASE}/api/internal/enroll-to-sequence`,
-            {
-              method: "POST",
-              headers: {
-                "Authorization": `Bearer ${env.HIGH_SHIN_INTERNAL_SECRET}`,
-                "Content-Type": "application/json",
-              },
-              body: JSON.stringify({ ping: true }),
-            }
-          );
-          const enrollText = await enrollRes.text();
-          diag.enroll_to_sequence_ping = { ok: enrollRes.ok, status: enrollRes.status, body: enrollText.substring(0, 200) };
-        } catch (e) {
-          diag.enroll_to_sequence_ping = { error: e.message };
-        }
       } else {
-        diag.high_shin_ping          = { skipped: "env_missing" };
-        diag.enroll_to_sequence_ping = { skipped: "env_missing" };
+        diag.high_shin_ping = { skipped: "env_missing" };
       }
 
       return json(diag);
@@ -746,6 +784,48 @@ export default {
         return json({ ok: true, message: "Cron実行完了。メールを確認してください。" });
       } catch (e) {
         return json({ ok: false, error: e.message }, 500);
+      }
+    }
+
+    // ─────────────────────────────────────────────
+    // Pay-kun トリガーから呼ばれる外部 API
+    // POST /api/external/register-member
+    // ─────────────────────────────────────────────
+    if (url.pathname === "/api/external/register-member" && request.method === "POST") {
+      // 認証
+      const auth   = request.headers.get("Authorization") || "";
+      const secret = (env.SHR_EXTERNAL_SECRET ?? "").trim();
+      if (!secret || auth !== `Bearer ${secret}`) {
+        return json({ error: "Unauthorized" }, 401);
+      }
+
+      let body;
+      try { body = await request.json(); }
+      catch { return json({ error: "invalid_json" }, 400); }
+
+      const { pay_product_id, customer_email, customer_name, pay_order_id, amount } = body;
+      if (!customer_email && !pay_product_id) {
+        return json({ error: "customer_email or pay_product_id is required" }, 400);
+      }
+
+      try {
+        const result = await registerMemberCore(env, {
+          pay_product_id,
+          customer_email,
+          customer_name,
+          pay_order_id,
+          amount,
+        });
+        return json({
+          ok:            result.ok,
+          shr_member_id: result.memberId,
+          is_new:        result.isNew,
+          plan_key:      result.planKey,
+          steps:         result.steps,
+        });
+      } catch (e) {
+        console.error("[shr-webhook] register-member error:", e.message);
+        return json({ error: e.message }, 500);
       }
     }
 
