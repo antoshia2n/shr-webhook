@@ -238,6 +238,7 @@ async function sendAdminNotification(env, { email, name, planLabel, subscription
   }
 
   const now = new Date().toLocaleString("ja-JP", { timeZone: "Asia/Tokyo" });
+  const subjectPrefix = "【しあらぼNEXT】新規入会：";
 
   try {
     const res = await fetch("https://api.resend.com/emails", {
@@ -249,7 +250,7 @@ async function sendAdminNotification(env, { email, name, planLabel, subscription
       body: JSON.stringify({
         from: fromEmail,
         to: [notifyEmail],
-        subject: `【しあらぼNEXT】新規入会：${name ?? "不明"} (${planLabel})`,
+        subject: `${subjectPrefix}${name ?? "不明"} (${planLabel})`,
         text: [
           `新規入会がありました。`,
           ``,
@@ -416,7 +417,8 @@ async function handleEvent(env, event, payload, debug = { steps: [] }) {
     case "charge_finished": {
       if (payload?.data?.status !== "successful") break;
       const meta    = payload?.data?.metadata ?? {};
-      const name    = meta["univapay-name"] ?? null;
+      // UTAGE連携は metadata.customer_name キーで送信する
+      const name    = meta["customer_name"] ?? meta["univapay-name"] ?? null;
       const planKey = meta["plan"] ?? "standard";
       const tokenId = payload?.data?.transaction_token_id;
 
