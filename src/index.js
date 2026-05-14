@@ -171,14 +171,18 @@ async function registerMemberCore(env, {
 
   if (!member) {
     // 3a. 新規会員 INSERT
+    const isSuspicious = !customer_name;
     const createResult = await supabase(env, "POST", "/shr_members", {
       user_id:               env.DEFAULT_USER_ID,
       email:                 customer_email ?? `pending_${pay_order_id}@shia2n.jp`,
       name:                  customer_name ?? null,
       plan:                  planKey,
-      subscription_status:   "active",
+      subscription_status:   isSuspicious ? "suspicious" : "active",
       enrolled_at:           new Date().toISOString(),
     });
+    if (isSuspicious) {
+      result.steps.push({ step: "suspicious_flag", reason: "name_is_null" });
+    }
     isNew    = true;
     memberId = Array.isArray(createResult.data) ? createResult.data[0]?.id : createResult.data?.id;
     result.steps.push({ step: "createMember", ok: createResult.ok, memberId });
@@ -227,7 +231,7 @@ async function registerMemberCore(env, {
   return result;
 }
 
-async function sendAdminNotification(env, { email, name, planLabel, subscriptionId }, debug) {
+async function sendAdminNotification(env, { email, name, planLabel, subscriptionId, isSuspicious = false }, debug) {
   const resendKey   = (env.RESEND_API_KEY    ?? "").trim();
   const fromEmail   = (env.RESEND_FROM_EMAIL ?? "").trim();
   const notifyEmail = (env.NAOKI_NOTIFY_EMAIL ?? "").trim();
@@ -238,7 +242,6 @@ async function sendAdminNotification(env, { email, name, planLabel, subscription
   }
 
   const now = new Date().toLocaleString("ja-JP", { timeZone: "Asia/Tokyo" });
-  const subjectPrefix = "【しあらぼNEXT】新規入会：";
 
   try {
     const res = await fetch("https://api.resend.com/emails", {
@@ -250,8 +253,12 @@ async function sendAdminNotification(env, { email, name, planLabel, subscription
       body: JSON.stringify({
         from: fromEmail,
         to: [notifyEmail],
-        subject: `${subjectPrefix}${name ?? "不明"} (${planLabel})`,
+        subject: `【しあらぼNEXT】${isSuspicious ? "⚠️要確認" : "新規入会"}：${name ?? "不明"} (${planLabel})`,
         text: [
+          ...(isSuspicious ? [
+            `⚠️ 名前が取得できませんでした。カードテスターの可能性があります。要確認。`,
+            ``,
+          ] : []),
           `新規入会がありました。`,
           ``,
           `名前：${name ?? "不明"}`,
@@ -441,20 +448,24 @@ async function handleEvent(env, event, payload, debug = { steps: [] }) {
       }
 
       if (!member) {
+        const isSuspicious = !name;
         const createResult = await supabase(env, "POST", "/shr_members", {
           user_id: env.DEFAULT_USER_ID,
           email: email ?? `pending_${subscriptionId}@shia2n.jp`,
           name,
           plan: planKey,
-          subscription_status: "pending",
+          subscription_status: isSuspicious ? "suspicious" : "pending",
           univa_subscription_id: subscriptionId,
           enrolled_at: new Date().toISOString(),
         });
+        if (isSuspicious) {
+          debug.steps.push({ step: "suspicious_flag", reason: "name_is_null" });
+        }
         debug.steps.push({ step: "createMember", ok: createResult.ok, status: createResult.status, data: createResult.data });
 
         if (createResult.ok) {
           await sendWelcomeEmail(env, { email, name, plan: planKey, subscriptionId }, debug);
-          await sendAdminNotification(env, { email, name, planLabel, subscriptionId }, debug);
+          await sendAdminNotification(env, { email, name, planLabel, subscriptionId, isSuspicious }, debug);
         }
       } else {
         await updateMemberById(env, member.id, {
