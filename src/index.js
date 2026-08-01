@@ -1,3 +1,18 @@
+// ---------------------------------------------------------------------------
+// しあらぼ決済受付（shr-webhook）
+//
+// 2026-08-01 変更：データベースへの通信を公開キー（SUPABASE_ANON_KEY）から
+//   管理者キー（SUPABASE_SERVICE_ROLE_KEY）へ切り替えた。
+//   この処理はブラウザに配られないサーバー側の処理であり、公開キーを使う理由が
+//   なかった。公開キーのままだと shr_members / shr_events / shr_billing_logs /
+//   pay_products を公開キーから閉じられない（閉じた瞬間にこの処理が止まる）。
+//   正本：2026-07-30 決定「画面は公開キーでデータベースに直接触らない」
+//
+//   切替箇所は6つ（supabase() の2・lookupProduct() の2・日次処理の2）と
+//   /diag の表示1つ。フォールバックは置いていない。設定漏れを黙って
+//   公開キーで動かさないため、未設定なら /diag が「未設定」と出る。
+// ---------------------------------------------------------------------------
+
 const CORS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "POST, OPTIONS",
@@ -15,8 +30,8 @@ async function supabase(env, method, path, body) {
   const res = await fetch(`${env.SUPABASE_URL}/rest/v1${path}`, {
     method,
     headers: {
-      "apikey": env.SUPABASE_ANON_KEY,
-      "Authorization": `Bearer ${env.SUPABASE_ANON_KEY}`,
+      "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
+      "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
       "Content-Type": "application/json",
       "Prefer": method === "POST" ? "return=representation" : "return=minimal",
     },
@@ -63,8 +78,8 @@ async function lookupProduct(env, planKey) {
     `&select=name,payment_status&limit=1`,
     {
       headers: {
-        apikey:        env.SUPABASE_ANON_KEY,
-        Authorization: `Bearer ${env.SUPABASE_ANON_KEY}`,
+        apikey:        env.SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
       },
     }
   );
@@ -615,8 +630,8 @@ async function handleScheduled(event, env, ctx) {
     `${env.SUPABASE_URL}/rest/v1/shr_events?date=eq.${today}&select=*&order=time.asc`,
     {
       headers: {
-        "apikey":        env.SUPABASE_ANON_KEY,
-        "Authorization": `Bearer ${env.SUPABASE_ANON_KEY}`,
+        "apikey":        env.SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
       },
     }
   );
@@ -707,7 +722,7 @@ export default {
       const diag = {
         env_check: {
           SUPABASE_URL:              has(env.SUPABASE_URL),
-          SUPABASE_ANON_KEY:         has(env.SUPABASE_ANON_KEY),
+          SUPABASE_SERVICE_ROLE_KEY:  has(env.SUPABASE_SERVICE_ROLE_KEY),
           DEFAULT_USER_ID:           has(env.DEFAULT_USER_ID),
           UNIVA_APP_TOKEN:           has(env.UNIVA_APP_TOKEN),
           UNIVA_APP_SECRET:          has(env.UNIVA_APP_SECRET),
