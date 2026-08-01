@@ -678,77 +678,75 @@ export default {
       return new Response(null, { status: 204, headers: CORS });
     }
 
+    // 認証の外に置かない：本番に副作用が出る操作は合言葉を必須にする（2026-08-01）
+    const requireSecret = () => {
+      const secret = (env.SHR_EXTERNAL_SECRET ?? "").trim();
+      const auth   = request.headers.get("Authorization") || "";
+      const q      = url.searchParams.get("key") || "";
+      if (!secret) return json({ error: "SHR_EXTERNAL_SECRET が未設定です" }, 503);
+      if (auth !== `Bearer ${secret}` && q !== secret) {
+        return json({ error: "Unauthorized" }, 401);
+      }
+      return null;
+    };
+
     if (url.pathname === "/health") {
       return json({ ok: true });
     }
 
     if (url.pathname === "/diag") {
+      // ------------------------------------------------------------------
+      // 2026-08-01 改訂：認証の外に置く画面は「設定あり／未設定」だけを返す。
+      //   ・キーの長さ・先頭文字・メールアドレスは出さない
+      //   ・本番の会員表への書き込みテストは廃止（生産データを試験対象にしない）
+      //   ・外部サービスの応答本文は出さない（つながったかどうかだけ）
+      //   正本：認証の外に置く診断画面は表示を存在確認だけに削る（2026-07-31）
+      // ------------------------------------------------------------------
+      const has = (v) => (v ? "設定あり" : "未設定");
+
       const diag = {
         env_check: {
-          SUPABASE_URL:              env.SUPABASE_URL              ? "set" : "MISSING",
-          SUPABASE_ANON_KEY:         env.SUPABASE_ANON_KEY         ? `set (length=${env.SUPABASE_ANON_KEY.length})` : "MISSING",
-          DEFAULT_USER_ID:           env.DEFAULT_USER_ID           ? `set (${env.DEFAULT_USER_ID.substring(0, 8)}...)` : "MISSING",
-          UNIVA_APP_TOKEN:           env.UNIVA_APP_TOKEN           ? `set (${env.UNIVA_APP_TOKEN.substring(0, 8)}...)` : "MISSING",
-          UNIVA_APP_SECRET:          env.UNIVA_APP_SECRET          ? `set (length=${env.UNIVA_APP_SECRET.length})` : "MISSING",
-          UNIVA_STORE_ID:            env.UNIVA_STORE_ID            ? `set (${env.UNIVA_STORE_ID.substring(0, 8)}...)` : "MISSING",
-          HIGH_SHIN_API_BASE:        env.HIGH_SHIN_API_BASE        ? `set (${env.HIGH_SHIN_API_BASE})` : "MISSING",
-          HIGH_SHIN_INTERNAL_SECRET: env.HIGH_SHIN_INTERNAL_SECRET ? `set (length=${env.HIGH_SHIN_INTERNAL_SECRET.length})` : "MISSING",
-          RESEND_API_KEY:            env.RESEND_API_KEY            ? `set (length=${env.RESEND_API_KEY.length})` : "MISSING",
-          NAOKI_NOTIFY_EMAIL:        env.NAOKI_NOTIFY_EMAIL        ? `set (${env.NAOKI_NOTIFY_EMAIL})` : "MISSING",
-          SHR_EXTERNAL_SECRET:       env.SHR_EXTERNAL_SECRET       ? `set (length=${env.SHR_EXTERNAL_SECRET.length})` : "MISSING",
+          SUPABASE_URL:              has(env.SUPABASE_URL),
+          SUPABASE_ANON_KEY:         has(env.SUPABASE_ANON_KEY),
+          DEFAULT_USER_ID:           has(env.DEFAULT_USER_ID),
+          UNIVA_APP_TOKEN:           has(env.UNIVA_APP_TOKEN),
+          UNIVA_APP_SECRET:          has(env.UNIVA_APP_SECRET),
+          UNIVA_STORE_ID:            has(env.UNIVA_STORE_ID),
+          HIGH_SHIN_API_BASE:        has(env.HIGH_SHIN_API_BASE),
+          HIGH_SHIN_INTERNAL_SECRET: has(env.HIGH_SHIN_INTERNAL_SECRET),
+          RESEND_API_KEY:            has(env.RESEND_API_KEY),
+          NAOKI_NOTIFY_EMAIL:        has(env.NAOKI_NOTIFY_EMAIL),
+          SHR_EXTERNAL_SECRET:       has(env.SHR_EXTERNAL_SECRET),
         },
       };
 
+      // 疎通は「つながるか」だけ。件数・中身は返さない。
       try {
-        const ping = await supabase(env, "GET", "/shr_members?limit=1");
-        diag.supabase_ping = { ok: ping.ok, status: ping.status };
-      } catch (e) {
-        diag.supabase_ping = { error: e.message };
+        const ping = await supabase(env, "GET", "/shr_members?select=id&limit=1");
+        diag.supabase_ping = ping.ok ? "OK" : "NG";
+      } catch {
+        diag.supabase_ping = "NG";
       }
 
       try {
-        const ping = await supabase(env, "GET", "/pay_products?limit=1");
-        diag.pay_products_ping = { ok: ping.ok, status: ping.status, count: ping.data?.length ?? 0 };
-      } catch (e) {
-        diag.pay_products_ping = { error: e.message };
+        const ping = await supabase(env, "GET", "/pay_products?select=id&limit=1");
+        diag.pay_products_ping = ping.ok ? "OK" : "NG";
+      } catch {
+        diag.pay_products_ping = "NG";
       }
 
-      // shr_events 疎通テスト（新規追加）
       try {
-        const ping = await supabase(env, "GET", "/shr_events?limit=1");
-        diag.shr_events_ping = { ok: ping.ok, status: ping.status, count: ping.data?.length ?? 0 };
-      } catch (e) {
-        diag.shr_events_ping = { error: e.message };
+        const ping = await supabase(env, "GET", "/shr_events?select=id&limit=1");
+        diag.shr_events_ping = ping.ok ? "OK" : "NG";
+      } catch {
+        diag.shr_events_ping = "NG";
       }
 
       try {
         const product = await lookupProduct(env, "standard");
-        diag.lookup_standard = product
-          ? { found: true, name: product.name, payment_status: product.payment_status }
-          : { found: false };
-      } catch (e) {
-        diag.lookup_standard = { error: e.message };
-      }
-
-      try {
-        const testId = `test-${Date.now()}`;
-        const insert = await supabase(env, "POST", "/shr_members", {
-          user_id: env.DEFAULT_USER_ID ?? "test-uid",
-          email: `diag_${testId}@shia2n.jp`,
-          name: "診断テスト",
-          plan: "standard",
-          subscription_status: "active",
-          univa_subscription_id: testId,
-        });
-        diag.test_insert = { ok: insert.ok, status: insert.status };
-        if (insert.ok) {
-          await supabase(env, "DELETE", `/shr_members?univa_subscription_id=eq.${testId}`);
-          diag.test_insert.cleaned_up = true;
-        } else {
-          diag.test_insert.error_detail = insert.data;
-        }
-      } catch (e) {
-        diag.test_insert = { error: e.message };
+        diag.lookup_standard = product ? "OK" : "NG";
+      } catch {
+        diag.lookup_standard = "NG";
       }
 
       try {
@@ -759,10 +757,9 @@ export default {
           `https://api.univapay.com/stores/${storeId}`,
           { headers: { "Authorization": `Bearer ${secret}.${token}` } }
         );
-        const uniText = await uniRes.text();
-        diag.univapay_ping = { ok: uniRes.ok, status: uniRes.status, body: uniText.substring(0, 300) };
-      } catch (e) {
-        diag.univapay_ping = { error: e.message };
+        diag.univapay_ping = uniRes.ok ? "OK" : "NG";
+      } catch {
+        diag.univapay_ping = "NG";
       }
 
       if (env.HIGH_SHIN_API_BASE && env.HIGH_SHIN_INTERNAL_SECRET) {
@@ -778,13 +775,12 @@ export default {
               body: JSON.stringify({ ping: true }),
             }
           );
-          const hsText = await hsRes.text();
-          diag.high_shin_ping = { ok: hsRes.ok, status: hsRes.status, body: hsText.substring(0, 200) };
-        } catch (e) {
-          diag.high_shin_ping = { error: e.message };
+          diag.high_shin_ping = hsRes.ok ? "OK" : "NG";
+        } catch {
+          diag.high_shin_ping = "NG";
         }
       } else {
-        diag.high_shin_ping = { skipped: "env_missing" };
+        diag.high_shin_ping = "未設定";
       }
 
       return json(diag);
@@ -792,6 +788,9 @@ export default {
 
     // Cronテスト用エンドポイント（今日のイベント通知を手動実行）
     if (url.pathname === "/test-cron" && request.method === "GET") {
+      const ng1 = requireSecret();
+      if (ng1) return ng1;
+
       try {
         await handleScheduled({}, env, {});
         return json({ ok: true, message: "Cron実行完了。メールを確認してください。" });
@@ -865,6 +864,9 @@ export default {
     }
 
     if (url.pathname === "/test-welcome" && request.method === "GET") {
+      const ng2 = requireSecret();
+      if (ng2) return ng2;
+
       const email          = url.searchParams.get("email");
       const name           = url.searchParams.get("name") ?? "テストユーザー";
       const planKey        = url.searchParams.get("plan") ?? "standard";
