@@ -907,28 +907,35 @@ export default {
     }
 
     // ── 決済業者からの通知の受け口 ───────────────────────────────
-    // 2026-08-02：合言葉つきの新しい窓口を用意した。
-    //   新： /univapay/<合言葉>   （または /univapay?key=<合言葉>）
-    //   旧： /univapay            （合言葉なし・当面は受け付ける）
-    // 決済が止まらないよう、業者側の設定を新しいURLへ変えるまでは旧も通す。
+    // 2026-08-02：合言葉つきの受け取りを用意した。次の2つのどちらでもよい。
+    //   ① 見出し（Authorization）に合言葉を入れる ← 決済くんと同じ方式・推奨
+    //   ② URL に合言葉を足す： /univapay/<合言葉> または /univapay?key=<合言葉>
+    // 旧： /univapay（合言葉なし・当面は受け付ける）
+    // 決済が止まらないよう、業者側の設定を変えるまでは旧も通す。
     // 旧に届いたときは知らせのメールを送り、切り替えが済んだかを分かるようにする。
     const isUnivapayPath =
       url.pathname === "/univapay" || url.pathname.startsWith("/univapay/");
 
     if (isUnivapayPath && request.method === "POST") {
       const webhookSecret = (env.UNIVAPAY_WEBHOOK_SECRET ?? "").trim();
-      const fromPath      = url.pathname.startsWith("/univapay/")
+
+      const fromPath  = url.pathname.startsWith("/univapay/")
         ? url.pathname.slice("/univapay/".length)
         : "";
-      const fromQuery     = url.searchParams.get("key") ?? "";
-      const provided      = (fromPath || fromQuery).trim();
+      const fromQuery = url.searchParams.get("key") ?? "";
+      const fromUrl   = (fromPath || fromQuery).trim();
 
-      // 合言葉が設定されていない間は、これまでどおり受け付ける（決済を止めないため）
-      const viaSecret = Boolean(webhookSecret) && provided === webhookSecret;
+      // 見出しは、合言葉そのものでも「Bearer 合言葉」でも受け取る
+      const rawHeader    = (request.headers.get("Authorization") ?? "").trim();
+      const fromHeader   = rawHeader.replace(/^Bearer\s+/i, "").trim();
+
+      const supplied = Boolean(fromUrl || fromHeader);
+      const viaSecret =
+        Boolean(webhookSecret) && (fromUrl === webhookSecret || fromHeader === webhookSecret);
 
       // 合言葉が設定済みで、違う合言葉が付いている場合だけ断る
       // （何も付いていない旧URLは、切り替えが済むまで通す）
-      if (webhookSecret && provided && !viaSecret) {
+      if (webhookSecret && supplied && !viaSecret) {
         return json({ error: "unauthorized" }, 401);
       }
 
