@@ -246,6 +246,55 @@ async function registerMemberCore(env, {
   return result;
 }
 
+/**
+ * 古い窓口（合言葉なし）に決済業者からの通知が届いたことを知らせる。
+ *
+ * 2026-08-02 追加。合言葉つきの新しい窓口へ移す作業の途中で使う。
+ * 決済を止めないため、古い窓口も当面は受け付ける。ただし黙って受け続けると
+ * 「業者側の設定を新しいURLへ変えたかどうか」が分からなくなるため、
+ * 届くたびに知らせる。このメールが来なくなれば、切り替えが済んだ証拠になる。
+ */
+async function sendLegacyPathNotice(env, { event }, debug) {
+  const resendKey   = (env.RESEND_API_KEY     ?? "").trim();
+  const fromEmail   = (env.RESEND_FROM_EMAIL  ?? "").trim();
+  const notifyEmail = (env.NAOKI_NOTIFY_EMAIL ?? "").trim();
+
+  if (!resendKey || !fromEmail || !notifyEmail) {
+    debug.steps.push({ step: "legacyPathNotice", skipped: "env_missing" });
+    return;
+  }
+
+  const now = new Date().toLocaleString("ja-JP", { timeZone: "Asia/Tokyo" });
+
+  try {
+    const res = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${resendKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        from: fromEmail,
+        to: [notifyEmail],
+        subject: "【しあらぼNEXT】決済の通知が古い窓口に届きました",
+        text: [
+          `決済業者からの通知が、合言葉なしの古い窓口に届きました。`,
+          `処理は通常どおり行われています（決済は止まっていません）。`,
+          ``,
+          `種類：${event ?? "不明"}`,
+          `日時：${now}`,
+          ``,
+          `UnivaPay の管理画面で、ウェブフックの通知先を新しいURLに変更すると、`,
+          `このお知らせは届かなくなります。届かなくなったら、古い窓口を閉じられます。`,
+        ].join("\n"),
+      }),
+    });
+    debug.steps.push({ step: "legacyPathNotice", ok: res.ok, status: res.status });
+  } catch (e) {
+    debug.steps.push({ step: "legacyPathNotice", error: e.message });
+  }
+}
+
 async function sendAdminNotification(env, { email, name, planLabel, subscriptionId, isSuspicious = false }, debug) {
   const resendKey   = (env.RESEND_API_KEY    ?? "").trim();
   const fromEmail   = (env.RESEND_FROM_EMAIL ?? "").trim();
@@ -732,6 +781,7 @@ export default {
           RESEND_API_KEY:            has(env.RESEND_API_KEY),
           NAOKI_NOTIFY_EMAIL:        has(env.NAOKI_NOTIFY_EMAIL),
           SHR_EXTERNAL_SECRET:       has(env.SHR_EXTERNAL_SECRET),
+          UNIVAPAY_WEBHOOK_SECRET:   has(env.UNIVAPAY_WEBHOOK_SECRET),
         },
       };
 
@@ -856,7 +906,32 @@ export default {
       }
     }
 
-    if (url.pathname === "/univapay" && request.method === "POST") {
+    // ── 決済業者からの通知の受け口 ───────────────────────────────
+    // 2026-08-02：合言葉つきの新しい窓口を用意した。
+    //   新： /univapay/<合言葉>   （または /univapay?key=<合言葉>）
+    //   旧： /univapay            （合言葉なし・当面は受け付ける）
+    // 決済が止まらないよう、業者側の設定を新しいURLへ変えるまでは旧も通す。
+    // 旧に届いたときは知らせのメールを送り、切り替えが済んだかを分かるようにする。
+    const isUnivapayPath =
+      url.pathname === "/univapay" || url.pathname.startsWith("/univapay/");
+
+    if (isUnivapayPath && request.method === "POST") {
+      const webhookSecret = (env.UNIVAPAY_WEBHOOK_SECRET ?? "").trim();
+      const fromPath      = url.pathname.startsWith("/univapay/")
+        ? url.pathname.slice("/univapay/".length)
+        : "";
+      const fromQuery     = url.searchParams.get("key") ?? "";
+      const provided      = (fromPath || fromQuery).trim();
+
+      // 合言葉が設定されていない間は、これまでどおり受け付ける（決済を止めないため）
+      const viaSecret = Boolean(webhookSecret) && provided === webhookSecret;
+
+      // 合言葉が設定済みで、違う合言葉が付いている場合だけ断る
+      // （何も付いていない旧URLは、切り替えが済むまで通す）
+      if (webhookSecret && provided && !viaSecret) {
+        return json({ error: "unauthorized" }, 401);
+      }
+
       let payload;
       try {
         payload = await request.json();
@@ -867,12 +942,17 @@ export default {
       const event = payload?.event;
       if (!event) return json({ error: "no_event" }, 400);
 
-      const debug = { event, steps: [] };
+      const debug = { event, steps: [], via: viaSecret ? "new" : "legacy" };
+
+      if (!viaSecret && webhookSecret) {
+        await sendLegacyPathNotice(env, { event }, debug);
+      }
+
       try {
         await handleEvent(env, event, payload, debug);
       } catch (err) {
         console.error("[shr-webhook] error:", err.message);
-        return json({ ok: false, error: err.message, stack: err.stack, debug });
+        return json({ ok: false, error: err.message, debug });
       }
 
       return json({ ok: true, event, debug });
