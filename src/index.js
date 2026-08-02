@@ -254,7 +254,7 @@ async function registerMemberCore(env, {
  * 「業者側の設定を新しいURLへ変えたかどうか」が分からなくなるため、
  * 届くたびに知らせる。このメールが来なくなれば、切り替えが済んだ証拠になる。
  */
-async function sendLegacyPathNotice(env, { event }, debug) {
+async function sendLegacyPathNotice(env, { event, via }, debug) {
   const resendKey   = (env.RESEND_API_KEY     ?? "").trim();
   const fromEmail   = (env.RESEND_FROM_EMAIL  ?? "").trim();
   const notifyEmail = (env.NAOKI_NOTIFY_EMAIL ?? "").trim();
@@ -266,6 +266,27 @@ async function sendLegacyPathNotice(env, { event }, debug) {
 
   const now = new Date().toLocaleString("ja-JP", { timeZone: "Asia/Tokyo" });
 
+  const isMismatch = via === "mismatch";
+  const subject = isMismatch
+    ? "【しあらぼNEXT】決済の通知の合言葉が合っていません"
+    : "【しあらぼNEXT】決済の通知が合言葉なしで届きました";
+
+  const lines = isMismatch
+    ? [
+        `決済業者からの通知に、設定と違う合言葉が付いていました。`,
+        `処理は通常どおり行われています（決済は止まっていません）。`,
+        ``,
+        `UnivaPay の管理画面で入力した合言葉を、貼り直してください。`,
+        `打ち間違い・前後の空白・改行が入っている可能性があります。`,
+      ]
+    : [
+        `決済業者からの通知が、合言葉なしで届きました。`,
+        `処理は通常どおり行われています（決済は止まっていません）。`,
+        ``,
+        `UnivaPay の管理画面で合言葉を設定すると、このお知らせは届かなくなります。`,
+        `届かなくなったら、合言葉を必須にできます。`,
+      ];
+
   try {
     const res = await fetch("https://api.resend.com/emails", {
       method: "POST",
@@ -276,17 +297,8 @@ async function sendLegacyPathNotice(env, { event }, debug) {
       body: JSON.stringify({
         from: fromEmail,
         to: [notifyEmail],
-        subject: "【しあらぼNEXT】決済の通知が古い窓口に届きました",
-        text: [
-          `決済業者からの通知が、合言葉なしの古い窓口に届きました。`,
-          `処理は通常どおり行われています（決済は止まっていません）。`,
-          ``,
-          `種類：${event ?? "不明"}`,
-          `日時：${now}`,
-          ``,
-          `UnivaPay の管理画面で、ウェブフックの通知先を新しいURLに変更すると、`,
-          `このお知らせは届かなくなります。届かなくなったら、古い窓口を閉じられます。`,
-        ].join("\n"),
+        subject,
+        text: [...lines, ``, `種類：${event ?? "不明"}`, `日時：${now}`].join("\n"),
       }),
     });
     debug.steps.push({ step: "legacyPathNotice", ok: res.ok, status: res.status });
@@ -933,11 +945,10 @@ export default {
       const viaSecret =
         Boolean(webhookSecret) && (fromUrl === webhookSecret || fromHeader === webhookSecret);
 
-      // 合言葉が設定済みで、違う合言葉が付いている場合だけ断る
-      // （何も付いていない旧URLは、切り替えが済むまで通す）
-      if (webhookSecret && supplied && !viaSecret) {
-        return json({ error: "unauthorized" }, 401);
-      }
+      // 移行中は「断らない」。合言葉が違っていても処理は通し、知らせだけ送る。
+      // 断ると、業者側の設定を打ち間違えたときに決済の通知が黙って落ちるため。
+      // 切り替えが済んだことを確認したうえで、段階3で必須にする。
+      const via = viaSecret ? "new" : (supplied ? "mismatch" : "legacy");
 
       let payload;
       try {
@@ -949,10 +960,10 @@ export default {
       const event = payload?.event;
       if (!event) return json({ error: "no_event" }, 400);
 
-      const debug = { event, steps: [], via: viaSecret ? "new" : "legacy" };
+      const debug = { event, steps: [], via };
 
-      if (!viaSecret && webhookSecret) {
-        await sendLegacyPathNotice(env, { event }, debug);
+      if (webhookSecret && via !== "new") {
+        await sendLegacyPathNotice(env, { event, via }, debug);
       }
 
       try {
