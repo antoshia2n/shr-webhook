@@ -911,7 +911,13 @@ export default {
       try { body = await request.json(); }
       catch { return json({ error: "invalid_json" }, 400); }
 
-      const { pay_product_id, customer_email, customer_name, pay_order_id, amount } = body;
+      // 2026-08-04：決済くんは商品の番号を product_id という名前で送っている。
+      // こちらは pay_product_id しか読んでおらず、常に空として扱っていた。
+      // その結果、商品が引けずプランが standard に決め打ちされていた（既存会員の
+      // 上書きも含む）。送る側を変えると他の呼び出し元を巻き添えにするため、
+      // 受け取る側で両方の名前を受け付ける。
+      const { customer_email, customer_name, pay_order_id, amount } = body;
+      const pay_product_id = body.pay_product_id ?? body.product_id ?? null;
       if (!customer_email && !pay_product_id) {
         return json({ error: "customer_email or pay_product_id is required" }, 400);
       }
