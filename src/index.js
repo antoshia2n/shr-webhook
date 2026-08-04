@@ -202,6 +202,25 @@ async function registerMemberCore(env, {
     memberId = Array.isArray(createResult.data) ? createResult.data[0]?.id : createResult.data?.id;
     result.steps.push({ step: "createMember", ok: createResult.ok, memberId });
 
+    // 2026-08-04：要確認（名前が取れていない）ときだけ、管理あてに知らせる。
+    // 決済くん経由のこの道は、これまで管理あての知らせを一度も出していなかった。
+    // 業者からの通知を直接受ける道は 2026-05 から要確認の知らせを出しており、
+    // 同じ出来事なのに片方だけ無音だったため揃える。
+    // 通常の入会では出さない。毎回届くと要確認が埋もれるため。
+    if (isSuspicious) {
+      await sendAdminNotification(
+        env,
+        {
+          email:          customer_email ?? null,
+          name:           customer_name ?? null,
+          planLabel,
+          subscriptionId: pay_order_id ?? "-",
+          isSuspicious:   true,
+        },
+        result
+      );
+    }
+
     // 新規会員には enroll-to-sequence を呼ぶ（選択肢A: shr-webhook が直接呼ぶ）
     const base   = (env.HIGH_SHIN_API_BASE ?? "").trim();
     const secret = (env.HIGH_SHIN_INTERNAL_SECRET ?? "").trim();
