@@ -285,26 +285,39 @@ async function sendLegacyPathNotice(env, { event, via }, debug) {
 
   const now = new Date().toLocaleString("ja-JP", { timeZone: "Asia/Tokyo" });
 
-  const isMismatch = via === "mismatch";
-  const subject = isMismatch
-    ? "【しあらぼNEXT】決済の通知の合言葉が合っていません"
-    : "【しあらぼNEXT】決済の通知が合言葉なしで届きました";
+  const isMismatch    = via === "mismatch";
+  const isSecretUnset = via === "secret_missing";
 
-  const lines = isMismatch
+  const subject = isSecretUnset
+    ? "【しあらぼNEXT】決済の通知の合言葉が未設定です"
+    : isMismatch
+      ? "【しあらぼNEXT】決済の通知の合言葉が合っていません"
+      : "【しあらぼNEXT】決済の通知が合言葉なしで届きました";
+
+  const lines = isSecretUnset
     ? [
-        `決済業者からの通知に、設定と違う合言葉が付いていました。`,
-        `処理は通常どおり行われています（決済は止まっていません）。`,
+        `この受け口に合言葉が設定されていません。`,
+        `安全のため、決済業者からの通知を受け取らずに返しました。`,
         ``,
-        `UnivaPay の管理画面で入力した合言葉を、貼り直してください。`,
-        `打ち間違い・前後の空白・改行が入っている可能性があります。`,
+        `決済業者は時間をおいて送り直すため、通知そのものは失われていません。`,
+        `Cloudflare の設定で UNIVAPAY_WEBHOOK_SECRET を入れ直してください。`,
       ]
-    : [
-        `決済業者からの通知が、合言葉なしで届きました。`,
-        `処理は通常どおり行われています（決済は止まっていません）。`,
-        ``,
-        `UnivaPay の管理画面で合言葉を設定すると、このお知らせは届かなくなります。`,
-        `届かなくなったら、合言葉を必須にできます。`,
-      ];
+    : isMismatch
+      ? [
+          `決済業者からの通知に、設定と違う合言葉が付いていました。`,
+          `2026-08-09 から合言葉を必須にしたため、この通知は受け取らずに返しました。`,
+          ``,
+          `決済業者は時間をおいて送り直すため、通知そのものは失われていません。`,
+          `UnivaPay の管理画面で入力した合言葉を、貼り直してください。`,
+          `打ち間違い・前後の空白・改行が入っている可能性があります。`,
+        ]
+      : [
+          `決済業者からの通知が、合言葉なしで届きました。`,
+          `2026-08-09 から合言葉を必須にしたため、この通知は受け取らずに返しました。`,
+          ``,
+          `決済業者は時間をおいて送り直すため、通知そのものは失われていません。`,
+          `UnivaPay の管理画面で合言葉が設定されているかを確認してください。`,
+        ];
 
   try {
     const res = await fetch("https://api.resend.com/emails", {
@@ -970,10 +983,21 @@ export default {
       const viaSecret =
         Boolean(webhookSecret) && (fromUrl === webhookSecret || fromHeader === webhookSecret);
 
-      // 移行中は「断らない」。合言葉が違っていても処理は通し、知らせだけ送る。
-      // 断ると、業者側の設定を打ち間違えたときに決済の通知が黙って落ちるため。
-      // 切り替えが済んだことを確認したうえで、段階3で必須にする。
       const via = viaSecret ? "new" : (supplied ? "mismatch" : "legacy");
+
+      // 2026-08-09 段階3：合言葉を必須にした。
+      // 8/02〜8/09 の間、合言葉なし・合言葉違いの知らせは1通も届かなかった
+      // （受信箱2つで実測・対照つき）。業者側の設定が効いていることを確認できたため、
+      // 合言葉の無い通知・違う通知は受け取らずに返す。
+      // 断っても通知は失われない。決済業者は 2xx が返るまで送り直すため。
+      // 合言葉が未設定のときも断る。未設定で素通しに戻ると、閉じた穴がそのまま開くため。
+      if (via !== "new") {
+        const reason = webhookSecret ? via : "secret_missing";
+        await sendLegacyPathNotice(env, { event: null, via: reason }, { steps: [] });
+        return webhookSecret
+          ? json({ error: "unauthorized" }, 401)
+          : json({ error: "webhook_secret_not_configured" }, 503);
+      }
 
       let payload;
       try {
@@ -986,10 +1010,6 @@ export default {
       if (!event) return json({ error: "no_event" }, 400);
 
       const debug = { event, steps: [], via };
-
-      if (webhookSecret && via !== "new") {
-        await sendLegacyPathNotice(env, { event, via }, debug);
-      }
 
       try {
         await handleEvent(env, event, payload, debug);
