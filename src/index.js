@@ -1009,6 +1009,24 @@ export default {
       return new Response(null, { status: 204, headers: CORS });
     }
 
+    // ============================================================
+    // 2026-09-06 切り替えの日だけ：受け取り口を止める
+    //   止める理由＝会員の表を旧から新へ移している最中に払いが来ると、
+    //   その人が新旧のどちらにも正しく作られないため（作業 79）。
+    //   404 ではなく 503 を返す。決済業者が後から送り直せる形にしておく。
+    //   /health と /diag は開けたままにする（止まっていることを外から確かめるため）。
+    //   切り替えが済んだら PAUSED を false に戻すのではなく、
+    //   このかたまりごと消した版に戻す（残すと次に誰かが踏む）。
+    // ============================================================
+    const PAUSED = true;
+    if (PAUSED && url.pathname !== "/health" && url.pathname !== "/diag") {
+      return json({
+        error:  "paused",
+        reason: "会員の表を移しています。時間をおいて送り直してください。",
+        since:  "2026-09-06",
+      }, 503);
+    }
+
     // 認証の外に置かない：本番に副作用が出る操作は合言葉を必須にする（2026-08-01）
     const requireSecret = () => {
       const secret = (env.SHR_EXTERNAL_SECRET ?? "").trim();
@@ -1022,7 +1040,7 @@ export default {
     };
 
     if (url.pathname === "/health") {
-      return json({ ok: true });
+      return json({ ok: true, paused: PAUSED, pausedSince: PAUSED ? "2026-09-06" : null });
     }
 
     if (url.pathname === "/diag") {
