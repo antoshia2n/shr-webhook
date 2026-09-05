@@ -11,6 +11,20 @@
 //   切替箇所は6つ（supabase() の2・lookupProduct() の2・日次処理の2）と
 //   /diag の表示1つ。フォールバックは置いていない。設定漏れを黙って
 //   公開キーで動かさないため、未設定なら /diag が「未設定」と出る。
+//
+// 2026-09-05 変更：新しい会員の表（member / member_subscription）にも
+//   同じ人と同じ支払いを写す「二重書き」を足した。
+//   ・旧の shr_members への書き込みは 1 行も変えていない。
+//   ・学ぶくんとポータルは切り替えの日まで旧の表を読む。新だけに書くと、
+//     その間に払った人が入れなくなるため、両方へ書く。
+//   ・写しの処理は例外を外へ出さない。決済の処理を止めないため。
+//     失敗しても旧の表には正しく入っているので、切り替えの日に写し直せば埋まる。
+//   ・権利（member_entitlement）はここでは作らない。プランと権利の対応表が
+//     2 つの名前の体系に割れており、どちらが正本かが決まっていないため。
+//     権利はいまも旧の道（引き金と定時実行）で組まれる。
+//   ・切り替えの日に外すのは syncToNewTables の呼び出し 5 か所だけ。
+//   正本：会員の仕組み ― 業務マニュアルの【新】の節
+//   https://www.notion.so/3d19c6c1c43981579dc0ded0a37f53ab
 // ---------------------------------------------------------------------------
 
 const CORS = {
@@ -108,6 +122,155 @@ async function logBilling(env, memberId, eventType, payload) {
     univa_charge_id: payload?.data?.id ?? null,
     raw_payload: payload,
   });
+}
+
+// ─────────────────────────────────────────────
+// 新しい会員の表への写し（2026-09-05 追加）
+//
+// 旧の書き込みが終わった後ろで呼ぶ。ここで起きた失敗は外へ出さない。
+// 決済の処理を止めないことを、新しい表がそろうことより優先する。
+// ─────────────────────────────────────────────
+
+/** 新しい表で決済業者を表す名前。移したときと同じ値を使う */
+const NEW_PROVIDER = "univapay";
+
+/**
+ * 新しい表に入れてよいメールだけを返す。
+ * 小文字にそろえる（member.email は小文字だけを受け付ける決まり）。
+ * 仮の値（pending_ で始まる）は入れない。新しい表は「空は空のまま」にする。
+ */
+function newTableEmail(email) {
+  const e = (email ?? "").trim().toLowerCase();
+  if (!e || e.startsWith("pending_")) return null;
+  return e;
+}
+
+/**
+ * 新しい member の表へ 1 人を写す。鍵はメール。
+ * 返りは member.id。写さなかったときは null。
+ */
+async function syncNewMember(env, { email, name }, debug) {
+  const normalized = newTableEmail(email);
+  if (!normalized) {
+    debug.steps.push({ step: "newMember", skipped: "no_real_email" });
+    return null;
+  }
+
+  try {
+    const body = { email: normalized, updated_at: new Date().toISOString() };
+    if (name) body.name = name;
+
+    const res = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/member?on_conflict=email&select=id`,
+      {
+        method: "POST",
+        headers: {
+          apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+          Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+          "Content-Type": "application/json",
+          Prefer: "resolution=merge-duplicates,return=representation",
+        },
+        body: JSON.stringify(body),
+      }
+    );
+    const text = await res.text();
+    if (!res.ok) {
+      debug.steps.push({
+        step: "newMember",
+        ok: false,
+        status: res.status,
+        body: text.substring(0, 200),
+      });
+      return null;
+    }
+    const rows = text ? JSON.parse(text) : null;
+    const memberId = Array.isArray(rows) ? (rows[0]?.id ?? null) : (rows?.id ?? null);
+    debug.steps.push({ step: "newMember", ok: true, memberId });
+    return memberId;
+  } catch (e) {
+    debug.steps.push({ step: "newMember", error: e.message });
+    return null;
+  }
+}
+
+/**
+ * 新しい member_subscription の表へ支払いを 1 件写す。
+ * 鍵は（決済業者・業者側の番号）の組。番号が無いときは行を作らない
+ * （銀行振込・単発の注文は支払いの表に載せない決まり）。
+ */
+async function syncNewSubscription(
+  env,
+  { memberId, providerRef, plan, status, nextBillingDate },
+  debug
+) {
+  if (!memberId) {
+    debug.steps.push({ step: "newSubscription", skipped: "no_member_id" });
+    return;
+  }
+  const ref = (providerRef ?? "").trim();
+  if (!ref) {
+    debug.steps.push({ step: "newSubscription", skipped: "no_provider_ref" });
+    return;
+  }
+
+  try {
+    const body = {
+      member_id:    memberId,
+      provider:     NEW_PROVIDER,
+      provider_ref: ref,
+      status:       status ?? "unknown",
+      updated_at:   new Date().toISOString(),
+    };
+    if (plan) body.plan = plan;
+    if (nextBillingDate) body.next_billing_date = nextBillingDate;
+
+    const res = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/member_subscription?on_conflict=provider,provider_ref`,
+      {
+        method: "POST",
+        headers: {
+          apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+          Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+          "Content-Type": "application/json",
+          Prefer: "resolution=merge-duplicates,return=minimal",
+        },
+        body: JSON.stringify(body),
+      }
+    );
+    if (!res.ok) {
+      const text = await res.text();
+      debug.steps.push({
+        step: "newSubscription",
+        ok: false,
+        status: res.status,
+        body: text.substring(0, 200),
+      });
+      return;
+    }
+    debug.steps.push({ step: "newSubscription", ok: true, providerRef: ref, status: body.status });
+  } catch (e) {
+    debug.steps.push({ step: "newSubscription", error: e.message });
+  }
+}
+
+/**
+ * 人と支払いをまとめて写す。呼ぶのは旧の書き込みが終わった後。
+ * 権利（member_entitlement）はここでは触らない。
+ */
+async function syncToNewTables(
+  env,
+  { email, name, subscriptionId, plan, status, nextBillingDate },
+  debug
+) {
+  const memberId = await syncNewMember(env, { email, name }, debug);
+  if (subscriptionId) {
+    await syncNewSubscription(
+      env,
+      { memberId, providerRef: subscriptionId, plan, status, nextBillingDate },
+      debug
+    );
+  }
+  return memberId;
 }
 
 async function sendWelcomeEmail(env, { email, name, plan, subscriptionId }, debug) {
@@ -256,6 +419,17 @@ async function registerMemberCore(env, {
     });
     result.steps.push({ step: "updateMember", memberId: member.id });
   }
+
+  // 新しい表への写し（2026-09-05 追加）。旧の書き込みが終わった後に行う。
+  // この道は業者側の継続の番号を持たないので、支払いの行は作らない。
+  await syncToNewTables(
+    env,
+    {
+      email: customer_email ?? member?.email ?? null,
+      name:  customer_name  ?? member?.name  ?? null,
+    },
+    result
+  );
 
   result.ok         = true;
   result.isNew      = isNew;
@@ -583,6 +757,20 @@ async function handleEvent(env, event, payload, debug = { steps: [] }) {
         });
         debug.steps.push({ step: "updateMember", memberId: member.id });
       }
+
+      // 新しい表への写し（2026-09-05 追加）。旧の書き込みが終わった後に行う。
+      // 状態は、いま旧の表へ書いたものと同じ値をそのまま使う。
+      await syncToNewTables(
+        env,
+        {
+          email:          email ?? member?.email ?? null,
+          name:           name  ?? member?.name  ?? null,
+          subscriptionId,
+          plan:           planKey ?? member?.plan ?? null,
+          status:         member ? "active" : (name ? "pending" : "suspicious"),
+        },
+        debug
+      );
       break;
     }
 
@@ -590,10 +778,23 @@ async function handleEvent(env, event, payload, debug = { steps: [] }) {
       if (!member) break;
       const nextDate = new Date();
       nextDate.setMonth(nextDate.getMonth() + 1);
+      const nextBillingDate = nextDate.toISOString().split("T")[0];
       await updateMemberById(env, member.id, {
         subscription_status: "active",
-        next_billing_date: nextDate.toISOString().split("T")[0],
+        next_billing_date: nextBillingDate,
       });
+      await syncToNewTables(
+        env,
+        {
+          email:  member.email,
+          name:   member.name,
+          subscriptionId,
+          plan:   member.plan,
+          status: "active",
+          nextBillingDate,
+        },
+        debug
+      );
       await sendReceiptEmail(env, member, debug);
       break;
     }
@@ -601,6 +802,17 @@ async function handleEvent(env, event, payload, debug = { steps: [] }) {
     case "subscription_failed": {
       if (!member) break;
       await updateMemberById(env, member.id, { subscription_status: "past_due" });
+      await syncToNewTables(
+        env,
+        {
+          email:  member.email,
+          name:   member.name,
+          subscriptionId,
+          plan:   member.plan,
+          status: "past_due",
+        },
+        debug
+      );
       await sendFailureEmailToUser(env, member, debug);
       await sendFailureEmailToAdmin(env, member, debug);
       break;
@@ -612,6 +824,17 @@ async function handleEvent(env, event, payload, debug = { steps: [] }) {
         subscription_status: "canceled",
         canceled_at: new Date().toISOString(),
       });
+      await syncToNewTables(
+        env,
+        {
+          email:  member.email,
+          name:   member.name,
+          subscriptionId,
+          plan:   member.plan,
+          status: "canceled",
+        },
+        debug
+      );
       await sendCancellationEmail(env, member, debug);
       break;
     }
@@ -849,6 +1072,21 @@ export default {
         diag.shr_events_ping = ping.ok ? "OK" : "NG";
       } catch {
         diag.shr_events_ping = "NG";
+      }
+
+      // 新しい会員の表への写し先（2026-09-05 追加）。つながるかだけを返す。
+      try {
+        const ping = await supabase(env, "GET", "/member?select=id&limit=1");
+        diag.new_member_ping = ping.ok ? "OK" : "NG";
+      } catch {
+        diag.new_member_ping = "NG";
+      }
+
+      try {
+        const ping = await supabase(env, "GET", "/member_subscription?select=id&limit=1");
+        diag.new_member_subscription_ping = ping.ok ? "OK" : "NG";
+      } catch {
+        diag.new_member_subscription_ping = "NG";
       }
 
       try {
