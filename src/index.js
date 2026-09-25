@@ -25,6 +25,17 @@
 //   ・切り替えの日に外すのは syncToNewTables の呼び出し 5 か所だけ。
 //   正本：会員の仕組み ― 業務マニュアルの【新】の節
 //   https://www.notion.so/3d19c6c1c43981579dc0ded0a37f53ab
+//
+// 2026-09-25 変更（作業 87 と作業 90 をこの 1 本にまとめた）：
+//   ・作業 87：新しい member の行へ写したとき、その行の legacy_shr_id が空なら
+//     旧の shr_members の番号を入れる。入っている行は上書きしない。
+//     失敗しても決済の処理は止めない。
+//   ・作業 90：決済の記録（shr_billing_logs）に、旧の番号（member_id）に加えて
+//     新しい member の番号（member_new_id）も書く。旧の shr_members を落とす前に、
+//     記録の行き先を新しい表へ移しておくため。
+//     新しい番号は legacy_shr_id で引く。見つからなければ空のまま書く。
+//     member_new_id の列が無いなどで記録が断られたら、旧の形でもう一度書く
+//     （決済の記録を落とさないため）。
 // ---------------------------------------------------------------------------
 
 const CORS = {
@@ -113,15 +124,39 @@ async function updateMemberById(env, id, fields) {
   );
 }
 
+// 旧の shr_members の番号から、新しい member の番号を引く（2026-09-25 作業 90）。
+// 見つからない・失敗したときは null。決済の処理は止めない。
+async function findNewMemberIdByLegacy(env, legacyShrId) {
+  if (!legacyShrId) return null;
+  try {
+    const { ok, data } = await supabase(env, "GET",
+      `/member?legacy_shr_id=eq.${legacyShrId}&select=id&limit=1`
+    );
+    if (!ok || !Array.isArray(data)) return null;
+    return data[0]?.id ?? null;
+  } catch (e) {
+    return null;
+  }
+}
+
 async function logBilling(env, memberId, eventType, payload) {
-  return await supabase(env, "POST", "/shr_billing_logs", {
+  const base = {
     member_id: memberId ?? null,
     event_type: eventType,
     amount: payload?.data?.charged_amount ?? payload?.data?.amount ?? null,
     currency: payload?.data?.charged_currency ?? payload?.data?.currency ?? "JPY",
     univa_charge_id: payload?.data?.id ?? null,
     raw_payload: payload,
+  };
+  const newMemberId = await findNewMemberIdByLegacy(env, memberId);
+  const first = await supabase(env, "POST", "/shr_billing_logs", {
+    ...base,
+    member_new_id: newMemberId,
   });
+  if (first.ok) return { ...first, newMemberId };
+  // 新しい列で断られたときだけ、旧の形でもう一度書く（記録を落とさない）
+  const retry = await supabase(env, "POST", "/shr_billing_logs", base);
+  return { ...retry, newMemberId: null, firstStatus: first.status };
 }
 
 // ─────────────────────────────────────────────
@@ -257,12 +292,34 @@ async function syncNewSubscription(
  * 人と支払いをまとめて写す。呼ぶのは旧の書き込みが終わった後。
  * 権利（member_entitlement）はここでは触らない。
  */
+/**
+ * 新しい member の行の legacy_shr_id が空なら、旧の番号を入れる（2026-09-25 作業 87）。
+ * 入っている行は上書きしない（条件に legacy_shr_id=is.null を付けている）。
+ * 例外は外へ出さない。決済の処理を止めないため。
+ */
+async function fillLegacyShrId(env, memberId, legacyShrId, debug) {
+  if (!memberId || !legacyShrId) {
+    debug.steps.push({ step: "fillLegacyShrId", skipped: "no_id" });
+    return;
+  }
+  try {
+    const res = await supabase(env, "PATCH",
+      `/member?id=eq.${memberId}&legacy_shr_id=is.null`,
+      { legacy_shr_id: legacyShrId }
+    );
+    debug.steps.push({ step: "fillLegacyShrId", ok: res.ok, status: res.status });
+  } catch (e) {
+    debug.steps.push({ step: "fillLegacyShrId", error: e.message });
+  }
+}
+
 async function syncToNewTables(
   env,
-  { email, name, subscriptionId, plan, status, nextBillingDate },
+  { email, name, subscriptionId, plan, status, nextBillingDate, legacyShrId },
   debug
 ) {
   const memberId = await syncNewMember(env, { email, name }, debug);
+  await fillLegacyShrId(env, memberId, legacyShrId ?? null, debug);
   if (subscriptionId) {
     await syncNewSubscription(
       env,
@@ -427,6 +484,7 @@ async function registerMemberCore(env, {
     {
       email: customer_email ?? member?.email ?? null,
       name:  customer_name  ?? member?.name  ?? null,
+      legacyShrId: memberId,
     },
     result
   );
@@ -729,6 +787,7 @@ async function handleEvent(env, event, payload, debug = { steps: [] }) {
         debug.steps.push({ step: "getEmail", error: e.message });
       }
 
+      let createdShrId = null;
       if (!member) {
         const isSuspicious = !name;
         const createResult = await supabase(env, "POST", "/shr_members", {
@@ -744,6 +803,7 @@ async function handleEvent(env, event, payload, debug = { steps: [] }) {
           debug.steps.push({ step: "suspicious_flag", reason: "name_is_null" });
         }
         debug.steps.push({ step: "createMember", ok: createResult.ok, status: createResult.status, data: createResult.data });
+        createdShrId = Array.isArray(createResult.data) ? (createResult.data[0]?.id ?? null) : (createResult.data?.id ?? null);
 
         if (createResult.ok) {
           await sendWelcomeEmail(env, { email, name, plan: planKey, subscriptionId }, debug);
@@ -768,6 +828,7 @@ async function handleEvent(env, event, payload, debug = { steps: [] }) {
           subscriptionId,
           plan:           planKey ?? member?.plan ?? null,
           status:         member ? "active" : (name ? "pending" : "suspicious"),
+          legacyShrId:    member?.id ?? createdShrId,
         },
         debug
       );
@@ -792,6 +853,7 @@ async function handleEvent(env, event, payload, debug = { steps: [] }) {
           plan:   member.plan,
           status: "active",
           nextBillingDate,
+          legacyShrId: member.id,
         },
         debug
       );
@@ -810,6 +872,7 @@ async function handleEvent(env, event, payload, debug = { steps: [] }) {
           subscriptionId,
           plan:   member.plan,
           status: "past_due",
+          legacyShrId: member.id,
         },
         debug
       );
@@ -832,6 +895,7 @@ async function handleEvent(env, event, payload, debug = { steps: [] }) {
           subscriptionId,
           plan:   member.plan,
           status: "canceled",
+          legacyShrId: member.id,
         },
         debug
       );
