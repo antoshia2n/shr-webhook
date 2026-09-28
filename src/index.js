@@ -36,7 +36,25 @@
 //     新しい番号は legacy_shr_id で引く。見つからなければ空のまま書く。
 //     member_new_id の列が無いなどで記録が断られたら、旧の形でもう一度書く
 //     （決済の記録を落とさないため）。
+//
+// 2026-09-28 変更：支払いから権利を新しい表（member_entitlement）へ付ける。
+//   ・決まり（2026-09-28 Naoki 確定）：決済が有効な人には、プランによらず
+//     shiarabo_basic を 1 つ、source=payment で付ける。解約されたら
+//     source=payment の行だけ外す。手当て（source=manual）の行には触らない。
+//   ・付けるのは 3 か所：決済くんからの登録・初回の決済成功・継続の決済成功。
+//     名前が取れない初回（suspicious）は付けない（カード試しの対策と揃える）。
+//   ・外すのは 1 か所：解約。決済の失敗（past_due）では外さない
+//     （1 週間後に再試行されるため）。
+//   ・同じ行を 2 本作らないよう、先に引いてから足す。
+//   ・写しと同じく例外は外へ出さない。決済の処理を止めないため。
+//   ・プレミアムに上乗せする権利は、プレミアムが売れた回に決める（止める条件）。
 // ---------------------------------------------------------------------------
+
+/** /diag が返す版。本番に出たかをこの文字列で確かめる */
+const APP_VERSION = "2026-09-28 支払いから権利 v1";
+
+/** 支払いから付ける権利のキー（2026-09-28 Naoki 確定・プランによらず 1 つ） */
+const PAYMENT_ENTITLEMENT_KEY = "shiarabo_basic";
 
 const CORS = {
   "Access-Control-Allow-Origin": "*",
@@ -313,9 +331,55 @@ async function fillLegacyShrId(env, memberId, legacyShrId, debug) {
   }
 }
 
+/**
+ * 支払いから出る権利を新しい表へ付ける・外す（2026-09-28 追加）。
+ * action は "grant"（付ける）か "revoke"（外す）。
+ * 触るのは source=payment の行だけ。manual の行には触らない。
+ * 例外は外へ出さない。決済の処理を止めないため。
+ */
+async function syncPaymentEntitlement(env, memberId, action, debug) {
+  if (!memberId) {
+    debug.steps.push({ step: "paymentEntitlement", skipped: "no_member_id" });
+    return;
+  }
+  if (action !== "grant" && action !== "revoke") {
+    debug.steps.push({ step: "paymentEntitlement", skipped: "no_action" });
+    return;
+  }
+  const filter =
+    `/member_entitlement?member_id=eq.${memberId}` +
+    `&key=eq.${PAYMENT_ENTITLEMENT_KEY}&source=eq.payment`;
+  try {
+    if (action === "revoke") {
+      const res = await supabase(env, "DELETE", filter);
+      debug.steps.push({ step: "paymentEntitlement", action, ok: res.ok, status: res.status });
+      return;
+    }
+    // grant：すでに payment の行があれば何もしない（2 本作らない）
+    const found = await supabase(env, "GET", `${filter}&select=id&limit=1`);
+    if (!found.ok) {
+      debug.steps.push({ step: "paymentEntitlement", action, ok: false, status: found.status, at: "lookup" });
+      return;
+    }
+    if (Array.isArray(found.data) && found.data.length > 0) {
+      debug.steps.push({ step: "paymentEntitlement", action, skipped: "already_granted" });
+      return;
+    }
+    const res = await supabase(env, "POST", "/member_entitlement", {
+      member_id: memberId,
+      key:       PAYMENT_ENTITLEMENT_KEY,
+      source:    "payment",
+      reason:    "決済から自動で付与",
+    });
+    debug.steps.push({ step: "paymentEntitlement", action, ok: res.ok, status: res.status });
+  } catch (e) {
+    debug.steps.push({ step: "paymentEntitlement", action, error: e.message });
+  }
+}
+
 async function syncToNewTables(
   env,
-  { email, name, subscriptionId, plan, status, nextBillingDate, legacyShrId },
+  { email, name, subscriptionId, plan, status, nextBillingDate, legacyShrId, entitlement },
   debug
 ) {
   const memberId = await syncNewMember(env, { email, name }, debug);
@@ -327,6 +391,7 @@ async function syncToNewTables(
       debug
     );
   }
+  await syncPaymentEntitlement(env, memberId, entitlement ?? null, debug);
   return memberId;
 }
 
@@ -485,6 +550,9 @@ async function registerMemberCore(env, {
       email: customer_email ?? member?.email ?? null,
       name:  customer_name  ?? member?.name  ?? null,
       legacyShrId: memberId,
+      // 2026-09-28：決済くん経由で登録された人にも権利を付ける。
+      // 名前が取れない新規（suspicious）は付けない。
+      entitlement: (!member && !customer_name) ? null : "grant",
     },
     result
   );
@@ -829,6 +897,8 @@ async function handleEvent(env, event, payload, debug = { steps: [] }) {
           plan:           planKey ?? member?.plan ?? null,
           status:         member ? "active" : (name ? "pending" : "suspicious"),
           legacyShrId:    member?.id ?? createdShrId,
+          // 2026-09-28：名前が取れない新規（suspicious）は付けない
+          entitlement:    (member || name) ? "grant" : null,
         },
         debug
       );
@@ -854,6 +924,7 @@ async function handleEvent(env, event, payload, debug = { steps: [] }) {
           status: "active",
           nextBillingDate,
           legacyShrId: member.id,
+          entitlement: "grant",
         },
         debug
       );
@@ -896,6 +967,7 @@ async function handleEvent(env, event, payload, debug = { steps: [] }) {
           plan:   member.plan,
           status: "canceled",
           legacyShrId: member.id,
+          entitlement: "revoke",
         },
         debug
       );
@@ -1100,6 +1172,7 @@ export default {
       const has = (v) => (v ? "設定あり" : "未設定");
 
       const diag = {
+        version: APP_VERSION,
         env_check: {
           SUPABASE_URL:              has(env.SUPABASE_URL),
           SUPABASE_SERVICE_ROLE_KEY:  has(env.SUPABASE_SERVICE_ROLE_KEY),
@@ -1151,6 +1224,14 @@ export default {
         diag.new_member_subscription_ping = ping.ok ? "OK" : "NG";
       } catch {
         diag.new_member_subscription_ping = "NG";
+      }
+
+      // 支払いから付ける権利の書き先（2026-09-28 追加）。つながるかだけを返す。
+      try {
+        const ping = await supabase(env, "GET", "/member_entitlement?select=id&limit=1");
+        diag.new_member_entitlement_ping = ping.ok ? "OK" : "NG";
+      } catch {
+        diag.new_member_entitlement_ping = "NG";
       }
 
       try {
