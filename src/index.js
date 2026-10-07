@@ -37,6 +37,10 @@
 //     member_new_id の列が無いなどで記録が断られたら、旧の形でもう一度書く
 //     （決済の記録を落とさないため）。
 //
+// 2026-10-08 変更：テストモード（mode=test）の知らせは記録も会員作成もせずに 200 で捨てる。
+//   UTAGE の代わりのデモのテスト決済が同じ店舗の知らせとしてここへ届き、
+//   本番の台帳に名前なしの新規（suspicious）が 1 人できたため（同日 Naoki 確定）。
+//
 // 2026-09-28 変更：支払いから権利を新しい表（member_entitlement）へ付ける。
 //   ・決まり（2026-09-28 Naoki 確定）：決済が有効な人には、プランによらず
 //     shiarabo_basic を 1 つ、source=payment で付ける。解約されたら
@@ -1485,6 +1489,15 @@ export default {
 
       const event = payload?.event;
       if (!event) return json({ error: "no_event" }, 400);
+
+      // 2026-10-08：テストモードの知らせは、記録も会員作成もせずに捨てる。
+      // 同じ店舗にテスト用の鍵（UTAGE の代わりのデモ）を作ったため、テスト決済の知らせもここへ届く。
+      // 2xx で返す（業者が送り直さないように）。本番の知らせは mode が live なので素通し。
+      const noticeMode = payload?.data?.mode ?? payload?.mode ?? null;
+      if (noticeMode === "test") {
+        console.log(`[shr-webhook] skipped test-mode notice: ${event}`);
+        return json({ ok: true, event, skipped: "test_mode" });
+      }
 
       const debug = { event, steps: [], via };
 
