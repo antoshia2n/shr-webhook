@@ -48,10 +48,21 @@
 //   ・同じ行を 2 本作らないよう、先に引いてから足す。
 //   ・写しと同じく例外は外へ出さない。決済の処理を止めないため。
 //   ・プレミアムに上乗せする権利は、プレミアムが売れた回に決める（止める条件）。
+//
+// 2026-10-07 変更（旧の 2 本を落とす行の 9 便の 4 番目）：
+//   ・誰の支払いかを、旧の shr_members ではなく新しい表で引く
+//     （member_subscription を業者の番号で引き、その会員の行。旧の番号は
+//     member.legacy_shr_id から取る）。旧の shr_members を読む所は 0 にした。
+//   ・旧の shr_members への書き込みは、表を落とす回まで続ける（二重書き）。
+//     書き先の番号は legacy_shr_id。空なら旧の表へは書かない。
+//   ・決済時にメールが取れなかった人も、新しい表に会員の行（メールは空）と
+//     継続課金の行を作る。次の月から新しい表で引けるようにするため。
+//   ・同じ知らせが 2 回届いたとき（同じ種類・同じ番号が 30 分以内）は、
+//     2 回目を記録も処理もせずに返す。10/06 に 1 回の課金が 2 回ずつ記録されたため。
 // ---------------------------------------------------------------------------
 
 /** /diag が返す版。本番に出たかをこの文字列で確かめる */
-const APP_VERSION = "2026-09-28 支払いから権利 v1";
+const APP_VERSION = "2026-10-07 新しい表で引く v1";
 
 /** 支払いから付ける権利のキー（2026-09-28 Naoki 確定・プランによらず 1 つ） */
 const PAYMENT_ENTITLEMENT_KEY = "shiarabo_basic";
@@ -103,12 +114,50 @@ async function getEmailFromUnivaPay(env, tokenId) {
   return data?.email ?? null;
 }
 
-// subscription_id で会員を検索
+// subscription_id で会員を引く（2026-10-07 から新しい表だけを読む）。
+// 返す形は前と同じ名前の欄をそろえる：id は旧の番号（legacy_shr_id・空もある）、
+// email・name・plan・univa_subscription_id。newMemberId に新しい会員の番号を足す。
+// 見つからない・引けないときは null（前と同じ扱い）。
 async function findMemberBySubscriptionId(env, subscriptionId) {
-  const { data } = await supabase(env, "GET",
-    `/shr_members?univa_subscription_id=eq.${subscriptionId}&limit=1`
+  if (!subscriptionId) return null;
+  const subRes = await supabase(env, "GET",
+    `/member_subscription?provider=eq.${NEW_PROVIDER}` +
+    `&provider_ref=eq.${encodeURIComponent(subscriptionId)}` +
+    `&select=id,member_id,plan,status&limit=1`
   );
-  return Array.isArray(data) ? data[0] : null;
+  const sub = subRes.ok && Array.isArray(subRes.data) ? subRes.data[0] : null;
+  if (!sub?.member_id) return null;
+  const memRes = await supabase(env, "GET",
+    `/member?id=eq.${sub.member_id}&select=id,email,name,legacy_shr_id&limit=1`
+  );
+  const mem = memRes.ok && Array.isArray(memRes.data) ? memRes.data[0] : null;
+  if (!mem) return null;
+  return {
+    id:                    mem.legacy_shr_id ?? null,
+    newMemberId:           mem.id,
+    email:                 mem.email ?? null,
+    name:                  mem.name ?? null,
+    plan:                  sub.plan ?? null,
+    subscription_status:   sub.status ?? null,
+    univa_subscription_id: subscriptionId,
+  };
+}
+
+// 同じ知らせの 2 回目かを見る（同じ種類・同じ番号の記録が 30 分以内にあるか）。
+// 引けなかったときは「2 回目ではない」として処理を続ける（決済を止めない）。
+async function isDuplicateNotice(env, eventType, chargeId) {
+  if (!eventType || !chargeId) return false;
+  try {
+    const since = new Date(Date.now() - 30 * 60 * 1000).toISOString();
+    const { ok, data } = await supabase(env, "GET",
+      `/shr_billing_logs?event_type=eq.${encodeURIComponent(eventType)}` +
+      `&univa_charge_id=eq.${encodeURIComponent(chargeId)}` +
+      `&created_at=gte.${encodeURIComponent(since)}&select=id&limit=1`
+    );
+    return ok && Array.isArray(data) && data.length > 0;
+  } catch {
+    return false;
+  }
 }
 
 // pay_products テーブルから plan_key に対応する商品情報を取得
@@ -136,6 +185,8 @@ async function getPlanLabel(env, planKey) {
 }
 
 async function updateMemberById(env, id, fields) {
+  // 旧の番号が無い人は旧の表へ書かない（2026-10-07）
+  if (!id) return;
   await supabase(env, "PATCH",
     `/shr_members?id=eq.${id}`,
     { ...fields, updated_at: new Date().toISOString() }
@@ -157,7 +208,7 @@ async function findNewMemberIdByLegacy(env, legacyShrId) {
   }
 }
 
-async function logBilling(env, memberId, eventType, payload) {
+async function logBilling(env, memberId, eventType, payload, knownNewMemberId = null) {
   const base = {
     member_id: memberId ?? null,
     event_type: eventType,
@@ -166,7 +217,7 @@ async function logBilling(env, memberId, eventType, payload) {
     univa_charge_id: payload?.data?.id ?? null,
     raw_payload: payload,
   };
-  const newMemberId = await findNewMemberIdByLegacy(env, memberId);
+  const newMemberId = knownNewMemberId ?? await findNewMemberIdByLegacy(env, memberId);
   const first = await supabase(env, "POST", "/shr_billing_logs", {
     ...base,
     member_new_id: newMemberId,
@@ -202,11 +253,30 @@ function newTableEmail(email) {
  * 新しい member の表へ 1 人を写す。鍵はメール。
  * 返りは member.id。写さなかったときは null。
  */
-async function syncNewMember(env, { email, name }, debug) {
+async function syncNewMember(env, { email, name, knownMemberId, allowNoEmail }, debug) {
+  // 新しい表で引けた人は、その番号をそのまま使う（2026-10-07）
+  if (knownMemberId) {
+    debug.steps.push({ step: "newMember", ok: true, memberId: knownMemberId, via: "known" });
+    return knownMemberId;
+  }
   const normalized = newTableEmail(email);
   if (!normalized) {
-    debug.steps.push({ step: "newMember", skipped: "no_real_email" });
-    return null;
+    if (!allowNoEmail) {
+      debug.steps.push({ step: "newMember", skipped: "no_real_email" });
+      return null;
+    }
+    // メールが取れなかった初回の決済：メールを空のまま会員の行を作る（2026-10-07）
+    try {
+      const body = { updated_at: new Date().toISOString() };
+      if (name) body.name = name;
+      const res = await supabase(env, "POST", "/member?select=id", body);
+      const memberId = Array.isArray(res.data) ? (res.data[0]?.id ?? null) : (res.data?.id ?? null);
+      debug.steps.push({ step: "newMember", ok: res.ok, status: res.status, memberId, via: "no_email" });
+      return res.ok ? memberId : null;
+    } catch (e) {
+      debug.steps.push({ step: "newMember", error: e.message, via: "no_email" });
+      return null;
+    }
   }
 
   try {
@@ -379,10 +449,10 @@ async function syncPaymentEntitlement(env, memberId, action, debug) {
 
 async function syncToNewTables(
   env,
-  { email, name, subscriptionId, plan, status, nextBillingDate, legacyShrId, entitlement },
+  { email, name, subscriptionId, plan, status, nextBillingDate, legacyShrId, entitlement, knownMemberId, allowNoEmail },
   debug
 ) {
-  const memberId = await syncNewMember(env, { email, name }, debug);
+  const memberId = await syncNewMember(env, { email, name, knownMemberId, allowNoEmail }, debug);
   await fillLegacyShrId(env, memberId, legacyShrId ?? null, debug);
   if (subscriptionId) {
     await syncNewSubscription(
@@ -443,13 +513,23 @@ async function registerMemberCore(env, {
 }) {
   const result = { steps: [] };
 
-  // 1. email で shr_members を検索
+  // 1. email で会員を引く（2026-10-07 から新しい表の member を読む）
+  //    旧の番号（legacy_shr_id）が入っていれば、旧の表のその行を更新する（二重書き）。
+  //    新しい表に居ても旧の番号が空なら、前と同じく旧の表へ行を作る。
   let member = null;
-  if (customer_email && !customer_email.startsWith("pending_")) {
-    const { data } = await supabase(env, "GET",
-      `/shr_members?email=eq.${encodeURIComponent(customer_email)}&order=enrolled_at.desc&limit=1`
+  let knownNewMemberId = null;
+  const lookupEmail = newTableEmail(customer_email);
+  if (lookupEmail) {
+    const { ok, data } = await supabase(env, "GET",
+      `/member?email=eq.${encodeURIComponent(lookupEmail)}&select=id,email,name,legacy_shr_id&limit=1`
     );
-    member = Array.isArray(data) ? data[0] : null;
+    const row = ok && Array.isArray(data) ? data[0] : null;
+    if (row) {
+      knownNewMemberId = row.id;
+      if (row.legacy_shr_id) {
+        member = { id: row.legacy_shr_id, email: row.email, name: row.name };
+      }
+    }
   }
 
   // 2. pay_products から plan_key・payment_status を取得
@@ -550,6 +630,7 @@ async function registerMemberCore(env, {
       email: customer_email ?? member?.email ?? null,
       name:  customer_name  ?? member?.name  ?? null,
       legacyShrId: memberId,
+      knownMemberId: knownNewMemberId,
       // 2026-09-28：決済くん経由で登録された人にも権利を付ける。
       // 名前が取れない新規（suspicious）は付けない。
       entitlement: (!member && !customer_name) ? null : "grant",
@@ -823,8 +904,15 @@ async function handleEvent(env, event, payload, debug = { steps: [] }) {
 
   debug.memberFound = !!member;
   debug.memberId = member?.id ?? null;
+  debug.newMemberId = member?.newMemberId ?? null;
 
-  const logResult = await logBilling(env, member?.id ?? null, event, payload);
+  // 同じ知らせの 2 回目は、記録も処理もしない（2026-10-07）
+  if (await isDuplicateNotice(env, event, payload?.data?.id ?? null)) {
+    debug.steps.push({ step: "duplicate", skipped: true });
+    return;
+  }
+
+  const logResult = await logBilling(env, member?.id ?? null, event, payload, member?.newMemberId ?? null);
   debug.steps.push({ step: "logBilling", ok: logResult.ok, status: logResult.status });
 
   switch (event) {
@@ -899,6 +987,8 @@ async function handleEvent(env, event, payload, debug = { steps: [] }) {
           legacyShrId:    member?.id ?? createdShrId,
           // 2026-09-28：名前が取れない新規（suspicious）は付けない
           entitlement:    (member || name) ? "grant" : null,
+          knownMemberId:  member?.newMemberId ?? null,
+          allowNoEmail:   !member,
         },
         debug
       );
@@ -924,6 +1014,7 @@ async function handleEvent(env, event, payload, debug = { steps: [] }) {
           status: "active",
           nextBillingDate,
           legacyShrId: member.id,
+          knownMemberId: member.newMemberId ?? null,
           entitlement: "grant",
         },
         debug
@@ -944,6 +1035,7 @@ async function handleEvent(env, event, payload, debug = { steps: [] }) {
           plan:   member.plan,
           status: "past_due",
           legacyShrId: member.id,
+          knownMemberId: member.newMemberId ?? null,
         },
         debug
       );
@@ -967,6 +1059,7 @@ async function handleEvent(env, event, payload, debug = { steps: [] }) {
           plan:   member.plan,
           status: "canceled",
           legacyShrId: member.id,
+          knownMemberId: member.newMemberId ?? null,
           entitlement: "revoke",
         },
         debug
@@ -1191,7 +1284,8 @@ export default {
 
       // 疎通は「つながるか」だけ。件数・中身は返さない。
       try {
-        const ping = await supabase(env, "GET", "/shr_members?select=id&limit=1");
+        // 2026-10-07：旧の shr_members は読まない。疎通は決済の記録の表で見る
+        const ping = await supabase(env, "GET", "/shr_billing_logs?select=id&limit=1");
         diag.supabase_ping = ping.ok ? "OK" : "NG";
       } catch {
         diag.supabase_ping = "NG";
