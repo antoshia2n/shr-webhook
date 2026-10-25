@@ -41,6 +41,10 @@
 //   UTAGE の代わりのデモのテスト決済が同じ店舗の知らせとしてここへ届き、
 //   本番の台帳に名前なしの新規（suspicious）が 1 人できたため（同日 Naoki 確定）。
 //
+// 2026-10-11 変更：metadata.source が lab の知らせ（UTAGE の代わり B の決済）は、記録も会員作成もせずに 200 で捨てる。
+//   B は metadata に customer_name を入れないので、ここで受けると名前なしの新規（suspicious）と歓迎メールができるため
+//   （統括 2026-10-10 の決め・Merge は 10/21 の本番の課金を見届けたあと）。
+//
 // 2026-09-28 変更：支払いから権利を新しい表（member_entitlement）へ付ける。
 //   ・決まり（2026-09-28 Naoki 確定）：決済が有効な人には、プランによらず
 //     shiarabo_basic を 1 つ、source=payment で付ける。解約されたら
@@ -66,7 +70,7 @@
 // ---------------------------------------------------------------------------
 
 /** /diag が返す版。本番に出たかをこの文字列で確かめる */
-const APP_VERSION = "2026-10-07 新しい表で引く v1";
+const APP_VERSION = "2026-10-11 B の知らせを捨てる v1";
 
 /** 支払いから付ける権利のキー（2026-09-28 Naoki 確定・プランによらず 1 つ） */
 const PAYMENT_ENTITLEMENT_KEY = "shiarabo_basic";
@@ -1497,6 +1501,14 @@ export default {
       if (noticeMode === "test") {
         console.log(`[shr-webhook] skipped test-mode notice: ${event}`);
         return json({ ok: true, event, skipped: "test_mode" });
+      }
+
+      // 2026-10-11：UTAGE の代わり（B）の決済の知らせは、記録も会員作成もせずに捨てる。
+      // B は窓の metadata に source=lab を付ける（utage-alt-demo #78）。B の台帳と権利は B が持つ。
+      const noticeSource = payload?.data?.metadata?.source ?? null;
+      if (noticeSource === "lab") {
+        console.log(`[shr-webhook] skipped lab notice: ${event}`);
+        return json({ ok: true, event, skipped: "lab" });
       }
 
       const debug = { event, steps: [], via };
